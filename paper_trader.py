@@ -23,7 +23,9 @@ import sys
 import os
 import csv
 import json
+import fcntl
 import argparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any
 from zoneinfo import ZoneInfo
@@ -66,7 +68,8 @@ INITIAL_CAPITAL = 10_000.0
 RISK_PCT = 0.01  # 1% risk per trade
 
 # Daily loss circuit breaker
-MAX_DAILY_LOSS = 150.0  # halt trading if daily net P&L drops below -$150
+MAX_DAILY_LOSS   = 150.0  # halt trading if daily net P&L drops below -$150
+DAILY_LOSS_LIMIT = MAX_DAILY_LOSS  # alias used by stress_test.py
 
 # Forced close time (EST)
 FORCE_CLOSE_HOUR = 15
@@ -109,20 +112,98 @@ CSV_COLUMNS = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SAFE I/O — atomic writes + advisory file locking
+#
+# Why both?
+#   • fcntl.flock: prevents concurrent reads/writes between cron and Streamlit
+#   • .tmp + os.replace: guarantees the file is never half-written on crash
+#     (os.replace is atomic on POSIX — kernel swaps the inode in one syscall)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_read_json(path: str, default: Any) -> Any:
+    """Read a JSON file with shared (read) lock. Returns `default` on any error."""
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                return json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception:
+        return default
+
+
+def _safe_write_json(path: str, data: Any) -> None:
+    """
+    Write JSON atomically with exclusive lock.
+    1. Acquire exclusive lock on a .lock sentinel file
+    2. Write to <path>.tmp
+    3. os.replace(.tmp → path) — atomic on POSIX
+    4. Release lock
+    Readers always see either the old complete file or the new one — never partial.
+    """
+    lock_path = path + ".lock"
+    tmp_path  = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(lock_path, "w") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+            os.replace(tmp_path, path)
+        finally:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YFINANCE SAFE WRAPPER — hard timeout via ThreadPoolExecutor
+#
+# yfinance.download() uses requests internally with no exposed timeout.
+# A DNS stall or slow Yahoo server can block the entire cron process for
+# minutes. We run it in a thread and enforce a hard wall-clock deadline.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _yf_download_safe(ticker: str, timeout_sec: int = 20, **kwargs):
+    """
+    Call yfinance.download() with a hard timeout.
+    Returns an empty DataFrame on timeout or any error.
+
+    We import yfinance at call time (not module load time) so that test mocks
+    patching the yfinance module object are picked up correctly. The lambda
+    captures the module reference at submission time, ensuring the thread uses
+    whatever yfinance.download is bound to at that moment (real or mocked).
+    """
+    import yfinance as _yf
+    import pandas as _pd
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(_yf.download, ticker, **kwargs)
+        result = future.result(timeout=timeout_sec)
+        executor.shutdown(wait=False)
+        return result
+    except FuturesTimeoutError:
+        print(f"  ⚠️  yfinance timeout ({timeout_sec}s) for {ticker} — using fallback")
+        executor.shutdown(wait=False, cancel_futures=True)
+        return _pd.DataFrame()
+    except Exception as e:
+        print(f"  ⚠️  yfinance error for {ticker}: {e} — using fallback")
+        executor.shutdown(wait=False)
+        return _pd.DataFrame()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRADE LOG (JSON)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_trades() -> List[Dict[str, Any]]:
-    if os.path.exists(TRADES_FILE):
-        with open(TRADES_FILE) as f:
-            return json.load(f)
-    return []
+    return _safe_read_json(TRADES_FILE, [])
 
 
 def save_trades(trades: List[Dict[str, Any]]) -> None:
-    with open(TRADES_FILE, "w") as f:
-        json.dump(trades, f, indent=2, default=str)
+    _safe_write_json(TRADES_FILE, trades)
 
 
 def log_trade(trade: Dict[str, Any]) -> None:
@@ -178,19 +259,14 @@ def _today_str() -> str:
 
 
 def load_daily_state() -> Dict[str, Any]:
-    if os.path.exists(DAILY_STATE_FILE):
-        with open(DAILY_STATE_FILE) as f:
-            state = json.load(f)
-        # Reset if it's a new day
-        if state.get("date") != _today_str():
-            return {"date": _today_str(), "daily_pnl": 0.0, "halted": False, "trades_today": 0}
-        return state
-    return {"date": _today_str(), "daily_pnl": 0.0, "halted": False, "trades_today": 0}
+    state = _safe_read_json(DAILY_STATE_FILE, {})
+    if not state or state.get("date") != _today_str():
+        return {"date": _today_str(), "daily_pnl": 0.0, "halted": False, "trades_today": 0}
+    return state
 
 
 def save_daily_state(state: Dict[str, Any]) -> None:
-    with open(DAILY_STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    _safe_write_json(DAILY_STATE_FILE, state)
 
 
 def check_daily_limit() -> bool:
@@ -268,15 +344,9 @@ def _signal_fingerprint(symbol: str, bar_time: Any, entry: float, direction: str
 def load_state_ledger() -> Dict[str, Any]:
     """Load the persistent state ledger, resetting if it's a new day."""
     today = _today_str()
-    if os.path.exists(STATE_LEDGER_FILE):
-        try:
-            with open(STATE_LEDGER_FILE) as f:
-                ledger = json.load(f)
-            if ledger.get("date") == today:
-                return ledger
-        except Exception:
-            pass
-    # Fresh ledger for new day
+    ledger = _safe_read_json(STATE_LEDGER_FILE, {})
+    if ledger.get("date") == today:
+        return ledger
     return {
         "date": today,
         "pending_orders": [],
@@ -285,8 +355,7 @@ def load_state_ledger() -> Dict[str, Any]:
 
 
 def save_state_ledger(ledger: Dict[str, Any]) -> None:
-    with open(STATE_LEDGER_FILE, "w") as f:
-        json.dump(ledger, f, indent=2, default=str)
+    _safe_write_json(STATE_LEDGER_FILE, ledger)
 
 
 def is_already_alerted(signal_id: str) -> bool:
@@ -401,10 +470,38 @@ def resolve_pending_orders(df: pd.DataFrame) -> List[Dict[str, Any]]:
         # Check if filled: did the bar touch our limit entry level?
         if direction == "buy":
             filled = current_low <= entry <= current_high or current_price <= entry
-            sl_hit_pending = current_low < sl  # blew through SL before touching entry
+            # SL hit before entry: price gapped past entry without touching it
+            sl_hit_pending = current_low < sl and current_low > entry
+            # GAP-OVER: single candle gaps below BOTH entry AND stop loss
+            # e.g. buy limit at 480, SL at 478 — bar opens at 477.50
+            # The order would technically fill at entry then immediately stop out.
+            # We treat this as a worst-case fill: filled at entry, exited at SL.
+            gap_over = current_high < entry  # entire bar is below our limit (for buy)
         else:
             filled = current_low <= entry <= current_high or current_price >= entry
-            sl_hit_pending = current_high > sl
+            sl_hit_pending = current_high > sl and current_high < entry
+            gap_over = current_low > entry  # entire bar is above our limit (for sell)
+
+        # Gap-over: bar completely skipped our entry level — fill at entry, close at SL
+        if gap_over:
+            order["status"] = "gap_over_sl"
+            gap_exit = sl  # worst-case exit at stop loss price
+            print(f"  [ledger] ⚡ GAP-OVER: {signal_id[:40]}")
+            print(f"           Bar [{current_low:.2f}–{current_high:.2f}] skipped entry "
+                  f"${entry:.2f} entirely — filling at entry, closing at SL ${sl:.2f}")
+            trades = load_trades()
+            for t in trades:
+                if t["id"] == order["trade_id"]:
+                    t["status"] = "closed_gap_sl"
+                    t["fill_price"] = entry
+                    t["exit_price"] = gap_exit
+                    t["exit_timestamp"] = datetime.now(EST).isoformat()
+                    raw_pnl = (gap_exit - entry) if direction == "buy" else (entry - gap_exit)
+                    t["gross_pnl"] = round(raw_pnl * t.get("position_size", 1), 2)
+                    t["net_pnl"]   = round(t["gross_pnl"] - t.get("commission", 0), 2)
+                    break
+            save_trades(trades)
+            continue
 
         if sl_hit_pending and not filled:
             order["status"] = "cancelled_sl_skip"
@@ -985,24 +1082,17 @@ def run_dry_run() -> None:
     # Step 5: Synthesize a test trade and write to ledger
     print("\n  [5/5] 🔧 Writing synthetic test order to trade_state.json...")
     last_close = float(last_bar["Close"])
-    try:
-        import yfinance as yf
-        vix_data = yf.download("^VIX", period="2d", interval="1d",
-                                progress=False, auto_adjust=True)
-        vix_now = float(vix_data["Close"].iloc[-1]) if not vix_data.empty else 21.5
-    except Exception:
-        vix_now = 21.5  # fallback for test
+    vix_data = _yf_download_safe("^VIX", timeout_sec=15, period="2d", interval="1d",
+                                  progress=False, auto_adjust=True)
+    vix_now = float(vix_data["Close"].iloc[-1]) if not vix_data.empty else 21.5
 
-    try:
-        qqq_monthly = yf.download("QQQ", period="2y", interval="1mo",
-                                   progress=False, auto_adjust=True)
-        if not qqq_monthly.empty and len(qqq_monthly) >= 20:
-            close_m = qqq_monthly["Close"].squeeze()
-            sma20 = float(close_m.rolling(20).mean().iloc[-1])
-            macro_pct = (last_close - sma20) / sma20 * 100
-        else:
-            macro_pct = 8.2
-    except Exception:
+    qqq_monthly = _yf_download_safe("QQQ", timeout_sec=20, period="2y", interval="1mo",
+                                     progress=False, auto_adjust=True)
+    if not qqq_monthly.empty and len(qqq_monthly) >= 20:
+        close_m = qqq_monthly["Close"].squeeze()
+        sma20 = float(close_m.rolling(20).mean().iloc[-1])
+        macro_pct = (last_close - sma20) / sma20 * 100
+    else:
         macro_pct = 8.2  # fallback
 
     # Build a realistic synthetic trade using real ATR
@@ -1161,25 +1251,26 @@ def main() -> None:
     new_signals = scan_for_signals(verbose=True)
 
     # Fetch live VIX + macro once (shared across all signals this run)
-    import yfinance as yf
+    # Hard-capped at 15/20s via _yf_download_safe — won't block the cron
     vix_now = None
     macro_pct = None
-    try:
-        vix_data = yf.download("^VIX", period="2d", interval="1d",
-                                progress=False, auto_adjust=True)
-        vix_now = float(vix_data["Close"].iloc[-1]) if not vix_data.empty else None
-    except Exception:
-        pass
-    try:
-        qqq_monthly = yf.download("QQQ", period="2y", interval="1mo",
-                                   progress=False, auto_adjust=True)
-        if not qqq_monthly.empty and len(qqq_monthly) >= 20:
+    vix_data = _yf_download_safe("^VIX", timeout_sec=15, period="2d", interval="1d",
+                                  progress=False, auto_adjust=True)
+    if not vix_data.empty:
+        try:
+            vix_now = float(vix_data["Close"].iloc[-1])
+        except Exception:
+            pass
+    qqq_monthly = _yf_download_safe("QQQ", timeout_sec=20, period="2y", interval="1mo",
+                                     progress=False, auto_adjust=True)
+    if not qqq_monthly.empty and len(qqq_monthly) >= 20:
+        try:
             close = qqq_monthly["Close"].squeeze()
             sma20 = float(close.rolling(20).mean().iloc[-1])
             price = float(close.iloc[-1])
             macro_pct = (price - sma20) / sma20 * 100
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     # Log new signals + fire Telegram alerts (deduplicated via state ledger)
     for signal in new_signals:
