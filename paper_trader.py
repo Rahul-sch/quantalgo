@@ -52,10 +52,14 @@ if "QQQ" not in INSTRUMENTS:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
-TRADES_FILE = os.path.join(RESULTS_DIR, "paper_trades.json")
-CSV_LOG_FILE = os.path.join(RESULTS_DIR, "paper_trades_log.csv")
+TRADES_FILE      = os.path.join(RESULTS_DIR, "paper_trades.json")
+CSV_LOG_FILE     = os.path.join(RESULTS_DIR, "paper_trades_log.csv")
 DAILY_STATE_FILE = os.path.join(RESULTS_DIR, "paper_daily_state.json")
+STATE_LEDGER_FILE = os.path.join(RESULTS_DIR, "trade_state.json")
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# Max bars a pending limit order stays alive before expiring (15m bars = 75 min)
+PENDING_ORDER_EXPIRY_BARS = 5
 
 # Capital & risk
 INITIAL_CAPITAL = 10_000.0
@@ -216,6 +220,267 @@ def update_daily_pnl(pnl: float) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# STATE LEDGER — Persistent memory across cron runs
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# trade_state.json schema:
+# {
+#   "date": "2026-03-31",          # resets daily
+#   "pending_orders": [            # limit orders waiting to be filled
+#     {
+#       "signal_id": "QQQ_1743400200_478.50_buy",  # fingerprint: ts+price+dir
+#       "trade_id": "QQQ_cont_20260331_093045",
+#       "direction": "buy",
+#       "entry_price": 478.50,
+#       "stop_loss": 476.20,
+#       "take_profit": 484.25,
+#       "armed_at": "2026-03-31T09:30:45-04:00",
+#       "armed_bar_time": "2026-03-31T09:30:00-04:00",  # bar that triggered
+#       "expires_after": "2026-03-31T10:45:00-04:00",   # max 5 bars = 75 min
+#       "status": "pending"        # pending | filled | expired | cancelled
+#     }
+#   ],
+#   "alerted_signal_ids": [        # signals we've already Telegram'd
+#     "QQQ_1743400200_478.50_buy",
+#     ...
+#   ]
+# }
+#
+# Signal fingerprint = f"{symbol}_{bar_epoch}_{entry_price:.2f}_{direction}"
+# This uniquely identifies a specific FVG setup regardless of which cron run sees it.
+
+def _signal_fingerprint(symbol: str, bar_time: Any, entry: float, direction: str) -> str:
+    """
+    Generate a stable fingerprint for a signal so we can deduplicate across runs.
+    Uses the bar's epoch timestamp (rounded to 15m), entry price, and direction.
+    """
+    try:
+        ts = pd.to_datetime(bar_time)
+        if hasattr(ts, 'timestamp'):
+            epoch = int(ts.timestamp() // 900 * 900)  # floor to 15m boundary
+        else:
+            epoch = int(ts.value // (900 * 1_000_000_000) * 900)
+    except Exception:
+        epoch = int(datetime.now(EST).timestamp() // 900 * 900)
+    return f"{symbol}_{epoch}_{entry:.2f}_{direction}"
+
+
+def load_state_ledger() -> Dict[str, Any]:
+    """Load the persistent state ledger, resetting if it's a new day."""
+    today = _today_str()
+    if os.path.exists(STATE_LEDGER_FILE):
+        try:
+            with open(STATE_LEDGER_FILE) as f:
+                ledger = json.load(f)
+            if ledger.get("date") == today:
+                return ledger
+        except Exception:
+            pass
+    # Fresh ledger for new day
+    return {
+        "date": today,
+        "pending_orders": [],
+        "alerted_signal_ids": [],
+    }
+
+
+def save_state_ledger(ledger: Dict[str, Any]) -> None:
+    with open(STATE_LEDGER_FILE, "w") as f:
+        json.dump(ledger, f, indent=2, default=str)
+
+
+def is_already_alerted(signal_id: str) -> bool:
+    """Return True if we've already sent a Telegram alert for this signal."""
+    ledger = load_state_ledger()
+    return signal_id in ledger.get("alerted_signal_ids", [])
+
+
+def mark_alerted(signal_id: str) -> None:
+    """Record that we've sent a Telegram alert for this signal."""
+    ledger = load_state_ledger()
+    if signal_id not in ledger["alerted_signal_ids"]:
+        ledger["alerted_signal_ids"].append(signal_id)
+    save_state_ledger(ledger)
+
+
+def add_pending_order(trade: Dict[str, Any], signal_id: str, bar_time: Any) -> None:
+    """
+    Register a new pending limit order in the state ledger.
+    Called when a signal fires and we arm the limit order.
+    """
+    ledger = load_state_ledger()
+
+    # Check for existing pending order with same fingerprint
+    existing = [p for p in ledger["pending_orders"] if p["signal_id"] == signal_id]
+    if existing:
+        return  # already registered — don't duplicate
+
+    # Compute expiry: bar_time + 5 bars (75 min)
+    try:
+        bar_dt = pd.to_datetime(bar_time)
+        if bar_dt.tzinfo is None:
+            bar_dt = bar_dt.tz_localize("US/Eastern")
+        else:
+            bar_dt = bar_dt.tz_convert("US/Eastern")
+        expires = bar_dt + pd.Timedelta(minutes=15 * PENDING_ORDER_EXPIRY_BARS)
+        expires_str = expires.isoformat()
+        bar_time_str = bar_dt.isoformat()
+    except Exception:
+        now = datetime.now(EST)
+        expires_str = (now + pd.Timedelta(minutes=75)).isoformat()
+        bar_time_str = now.isoformat()
+
+    order = {
+        "signal_id":      signal_id,
+        "trade_id":       trade["id"],
+        "direction":      trade["direction"],
+        "entry_price":    trade["entry_price"],
+        "stop_loss":      trade["stop_loss"],
+        "take_profit":    trade["take_profit"],
+        "armed_at":       datetime.now(EST).isoformat(),
+        "armed_bar_time": bar_time_str,
+        "expires_after":  expires_str,
+        "status":         "pending",
+    }
+    ledger["pending_orders"].append(order)
+    save_state_ledger(ledger)
+    print(f"  [ledger] Pending order armed: {signal_id[:50]}")
+    print(f"           Expires: {expires_str}")
+
+
+def resolve_pending_orders(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Check all pending limit orders against the latest price bars.
+    For each pending order:
+      - FILLED: current bar crossed through the entry price → promote to open trade
+      - EXPIRED: current time is past expires_after → cancel
+      - SL HIT (while pending): price blew through SL before touching entry → cancel
+      - Still PENDING: do nothing
+
+    Returns list of newly-filled trade dicts (to be merged into trades file).
+    Called at the START of each cron run, before scanning for new signals.
+    """
+    ledger = load_state_ledger()
+    pending = [p for p in ledger["pending_orders"] if p["status"] == "pending"]
+
+    if not pending:
+        return []
+
+    now = datetime.now(EST)
+    current_bar = df.iloc[-1]
+    current_high = float(current_bar["High"])
+    current_low  = float(current_bar["Low"])
+    current_price = float(current_bar["Close"])
+    filled_trades = []
+
+    print(f"\n  [ledger] Checking {len(pending)} pending order(s)... "
+          f"(price: ${current_price:.2f})")
+
+    for order in pending:
+        signal_id = order["signal_id"]
+        entry  = order["entry_price"]
+        sl     = order["stop_loss"]
+        tp     = order["take_profit"]
+        direction = order["direction"]
+
+        # Check expiry
+        try:
+            expires_dt = pd.to_datetime(order["expires_after"])
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.tz_localize("US/Eastern")
+            else:
+                expires_dt = expires_dt.tz_convert("US/Eastern")
+            now_aware = now if now.tzinfo else now.replace(tzinfo=ZoneInfo("US/Eastern"))
+            if now_aware > expires_dt:
+                order["status"] = "expired"
+                print(f"  [ledger] ⏰ EXPIRED: {signal_id[:40]} (entry ${entry:.2f} never filled)")
+                continue
+        except Exception:
+            pass
+
+        # Check if filled: did the bar touch our limit entry level?
+        if direction == "buy":
+            filled = current_low <= entry <= current_high or current_price <= entry
+            sl_hit_pending = current_low < sl  # blew through SL before touching entry
+        else:
+            filled = current_low <= entry <= current_high or current_price >= entry
+            sl_hit_pending = current_high > sl
+
+        if sl_hit_pending and not filled:
+            order["status"] = "cancelled_sl_skip"
+            print(f"  [ledger] ❌ CANCELLED (SL skip): {signal_id[:40]} — "
+                  f"price moved through SL ${sl:.2f} without filling entry ${entry:.2f}")
+            continue
+
+        if filled:
+            order["status"] = "filled"
+            print(f"  [ledger] ✅ FILLED: {signal_id[:40]} @ ${entry:.2f}")
+
+            # Update the trade record from "pending" → "open" in trades file
+            trades = load_trades()
+            for t in trades:
+                if t["id"] == order["trade_id"]:
+                    t["status"] = "open"
+                    t["fill_timestamp"] = datetime.now(EST).isoformat()
+                    t["fill_price"] = entry
+                    filled_trades.append(t)
+                    break
+            save_trades(trades)
+        else:
+            print(f"  [ledger] ⏳ PENDING: {signal_id[:40]} — "
+                  f"waiting for ${entry:.2f} "
+                  f"({'buy' if direction=='buy' else 'sell'}, "
+                  f"current: ${current_price:.2f})")
+
+    # Save updated ledger
+    save_state_ledger(ledger)
+    return filled_trades
+
+
+def expire_old_pending_orders() -> None:
+    """Expire any pending orders past their expiry time. Called at start of each run."""
+    ledger = load_state_ledger()
+    now = datetime.now(EST)
+    now_aware = now if now.tzinfo else now.replace(tzinfo=ZoneInfo("US/Eastern"))
+    changed = False
+    for order in ledger["pending_orders"]:
+        if order["status"] != "pending":
+            continue
+        try:
+            exp = pd.to_datetime(order["expires_after"])
+            if exp.tzinfo is None:
+                exp = exp.tz_localize("US/Eastern")
+            else:
+                exp = exp.tz_convert("US/Eastern")
+            if now_aware > exp:
+                order["status"] = "expired"
+                changed = True
+                print(f"  [ledger] ⏰ Expired pending order: {order['signal_id'][:40]}")
+        except Exception:
+            pass
+    if changed:
+        save_state_ledger(ledger)
+
+
+def print_ledger_status() -> None:
+    """Print a summary of the current state ledger."""
+    ledger = load_state_ledger()
+    pending  = [p for p in ledger["pending_orders"] if p["status"] == "pending"]
+    filled   = [p for p in ledger["pending_orders"] if p["status"] == "filled"]
+    expired  = [p for p in ledger["pending_orders"] if p["status"] in ("expired", "cancelled_sl_skip")]
+    alerted  = ledger.get("alerted_signal_ids", [])
+
+    print(f"\n  📋 STATE LEDGER ({ledger.get('date', '?')})")
+    print(f"     Pending orders:  {len(pending)}")
+    print(f"     Filled today:    {len(filled)}")
+    print(f"     Expired/Cancel:  {len(expired)}")
+    print(f"     Alerts sent:     {len(alerted)}")
+    for p in pending:
+        print(f"     ⏳ {p['direction'].upper()} @ ${p['entry_price']:.2f} "
+              f"| expires {p['expires_after'][11:16]}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TIME CHECKS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -328,6 +593,26 @@ def scan_for_signals(verbose: bool = True) -> List[Dict[str, Any]]:
             net_potential = (adj_entry - adj_exit_tp) * position_size - commission
 
         current_price = float(df["Close"].iloc[-1])
+
+        # Build signal fingerprint for deduplication
+        bar_time = df.index[bar_idx]
+        signal_id = _signal_fingerprint("QQQ", bar_time, entry, direction)
+
+        # Skip if we've already armed this exact signal in a prior cron run
+        if is_already_alerted(signal_id):
+            if verbose:
+                print(f"  [ledger] Skipping duplicate signal: {signal_id[:50]}")
+            continue
+
+        # Also skip if there's already a pending order for this signal
+        ledger_check = load_state_ledger()
+        existing_pending = [p for p in ledger_check["pending_orders"]
+                            if p["signal_id"] == signal_id and p["status"] == "pending"]
+        if existing_pending:
+            if verbose:
+                print(f"  [ledger] Order already pending: {signal_id[:50]}")
+            continue
+
         trade_id = f"QQQ_cont_{datetime.now(EST).strftime('%Y%m%d_%H%M%S')}"
 
         trade = {
@@ -352,8 +637,9 @@ def scan_for_signals(verbose: bool = True) -> List[Dict[str, Any]]:
             "adx_at_entry": indicators["adx_at_entry"],
             "rvol_at_entry": indicators["rvol_at_entry"],
             "ema_direction": indicators["ema_direction"],
-            # Status
-            "status": "open",
+            # Status — starts as "pending" until price fills the limit entry
+            "status": "pending",
+            "signal_id": signal_id,
             "exit_price": None,
             "exit_timestamp": None,
             "gross_pnl": None,
@@ -363,6 +649,9 @@ def scan_for_signals(verbose: bool = True) -> List[Dict[str, Any]]:
         }
 
         new_trades.append(trade)
+
+        # Register in state ledger immediately
+        add_pending_order(trade, signal_id, bar_time)
 
         if verbose:
             emoji = "🟢" if direction == "buy" else "🔴"
@@ -629,10 +918,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.reset:
-        for f in [TRADES_FILE, CSV_LOG_FILE, DAILY_STATE_FILE]:
+        for f in [TRADES_FILE, CSV_LOG_FILE, DAILY_STATE_FILE, STATE_LEDGER_FILE]:
             if os.path.exists(f):
                 os.remove(f)
-        print("  🗑️  All paper trades cleared.")
+        print("  🗑️  All paper trades and state ledger cleared.")
         return
 
     if args.summary:
@@ -672,35 +961,51 @@ def main() -> None:
         print(f"\n  ⚠️  Outside market hours ({now_est.strftime('%H:%M %Z')})")
         print("  Scanning anyway — signals based on last available data\n")
 
+    # ── State Ledger: expire old orders + resolve pending fills ──
+    print_ledger_status()
+    expire_old_pending_orders()
+    # Fetch latest bars to check pending fills before scanning for new signals
+    _df_for_pending = download_data("QQQ", period="5d", interval="15m")
+    if not _df_for_pending.empty:
+        resolve_pending_orders(_df_for_pending)
+
     # Scan for new signals
     new_signals = scan_for_signals(verbose=True)
 
-    # Log new signals + fire Telegram alerts
+    # Fetch live VIX + macro once (shared across all signals this run)
+    import yfinance as yf
+    vix_now = None
+    macro_pct = None
+    try:
+        vix_data = yf.download("^VIX", period="2d", interval="1d",
+                                progress=False, auto_adjust=True)
+        vix_now = float(vix_data["Close"].iloc[-1]) if not vix_data.empty else None
+    except Exception:
+        pass
+    try:
+        qqq_monthly = yf.download("QQQ", period="2y", interval="1mo",
+                                   progress=False, auto_adjust=True)
+        if not qqq_monthly.empty and len(qqq_monthly) >= 20:
+            close = qqq_monthly["Close"].squeeze()
+            sma20 = float(close.rolling(20).mean().iloc[-1])
+            price = float(close.iloc[-1])
+            macro_pct = (price - sma20) / sma20 * 100
+    except Exception:
+        pass
+
+    # Log new signals + fire Telegram alerts (deduplicated via state ledger)
     for signal in new_signals:
         log_trade(signal)
         append_csv_row(signal)
-        # Fetch live VIX + macro for the alert payload
-        try:
-            import yfinance as yf
-            vix_data = yf.download("^VIX", period="2d", interval="1d",
-                                    progress=False, auto_adjust=True)
-            vix_now = float(vix_data["Close"].iloc[-1]) if not vix_data.empty else None
-        except Exception:
-            vix_now = None
-        try:
-            qqq_monthly = yf.download("QQQ", period="2y", interval="1mo",
-                                       progress=False, auto_adjust=True)
-            if not qqq_monthly.empty and len(qqq_monthly) >= 20:
-                close = qqq_monthly["Close"].squeeze()
-                sma20 = float(close.rolling(20).mean().iloc[-1])
-                price = float(close.iloc[-1])
-                macro_pct = (price - sma20) / sma20 * 100
-            else:
-                macro_pct = None
-        except Exception:
-            macro_pct = None
+        signal_id = signal.get("signal_id", "")
+        # Double-check: only alert if not already alerted (guard against race conditions)
+        if signal_id and is_already_alerted(signal_id):
+            print(f"  [ledger] Alert already sent for {signal_id[:40]} — skipping")
+            continue
         try:
             alert_new_trade(signal, vix=vix_now, macro_pct=macro_pct)
+            if signal_id:
+                mark_alerted(signal_id)  # record that we sent this alert
         except Exception as e:
             print(f"  [alert] Telegram notification failed: {e}")
 
