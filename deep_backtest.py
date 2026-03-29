@@ -133,54 +133,98 @@ def download_alpaca(symbol: str = "QQQ", years: int = 2) -> pd.DataFrame:
     return bars
 
 
-def download_polygon(symbol: str = "QQQ", years: int = 2) -> pd.DataFrame:
+def download_massive(symbol: str = "QQQ", years: int = 2) -> pd.DataFrame:
     """
-    Download 2yr 15m data from Polygon.io (free tier: 2yr history on stocks).
-    Requires: POLYGON_API_KEY in environment / .env
+    Download 2yr 15m data from Massive.com (formerly Polygon.io).
+    Free tier supports 2yr+ of historical 15m data.
+    Requires: POLYGON_API_KEY or MASSIVE_API_KEY in environment / .env
     """
     try:
-        from polygon import RESTClient
+        from massive import RESTClient
     except ImportError:
-        print("  [polygon] Install: pip install polygon-api-client")
+        print("  [massive] Install: pip3 install -U massive")
         return pd.DataFrame()
 
-    api_key = os.environ.get("POLYGON_API_KEY")
+    api_key = os.environ.get("MASSIVE_API_KEY") or os.environ.get("POLYGON_API_KEY")
     if not api_key:
-        print("  [polygon] Set POLYGON_API_KEY in .env")
+        print("  [massive] Set MASSIVE_API_KEY in .env")
         return pd.DataFrame()
 
-    print(f"  [polygon] Downloading {symbol} 15m ({years}yr)...")
+    print(f"  [massive] Downloading {symbol} 15m ({years}yr)...")
     client = RESTClient(api_key)
 
     end = datetime.now()
     start = end - timedelta(days=years * 365)
 
+    import time
+
     bars = []
-    for agg in client.list_aggs(
-        symbol,
-        1, "minute",
-        start.strftime("%Y-%m-%d"),
-        end.strftime("%Y-%m-%d"),
-        multiplier=15,
-        limit=50000,
-    ):
-        bars.append({
-            "timestamp": pd.Timestamp(agg.timestamp, unit="ms", tz="UTC"),
-            "Open": agg.open, "High": agg.high,
-            "Low": agg.low, "Close": agg.close,
-            "Volume": agg.volume,
-        })
+    # Fetch in 6-month chunks to avoid rate limits
+    chunk_months = 6
+    current_end = end
+    current_start = end - timedelta(days=chunk_months * 30)
+    chunk_num = 0
+    total_chunks = (years * 12) // chunk_months
+
+    while current_start >= start - timedelta(days=30):
+        chunk_num += 1
+        chunk_start_str = max(current_start, start).strftime("%Y-%m-%d")
+        chunk_end_str = current_end.strftime("%Y-%m-%d")
+
+        print(f"  [massive] Chunk {chunk_num}/{total_chunks}: {chunk_start_str} → {chunk_end_str}...")
+
+        retries = 3
+        for attempt in range(retries):
+            try:
+                for agg in client.list_aggs(
+                    symbol,
+                    15, "minute",
+                    chunk_start_str,
+                    chunk_end_str,
+                    limit=50000,
+                    adjusted=True,
+                ):
+                    bars.append({
+                        "timestamp": pd.Timestamp(agg.timestamp, unit="ms", tz="UTC"),
+                        "Open": agg.open, "High": agg.high,
+                        "Low": agg.low, "Close": agg.close,
+                        "Volume": agg.volume,
+                    })
+                break  # success
+            except Exception as e:
+                if "429" in str(e) and attempt < retries - 1:
+                    wait = 15 * (attempt + 1)
+                    print(f"  [massive] Rate limited — waiting {wait}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"  [massive] Chunk error: {e}")
+                    break
+
+        # Small pause between chunks
+        time.sleep(2)
+
+        current_end = current_start - timedelta(days=1)
+        current_start = current_end - timedelta(days=chunk_months * 30)
+
+        if current_end < start:
+            break
 
     if not bars:
-        print("  [polygon] No data returned.")
+        print("  [massive] No data returned — check API key and subscription tier.")
         return pd.DataFrame()
 
     df = pd.DataFrame(bars).set_index("timestamp")
     df.index = df.index.tz_convert("US/Eastern")
     df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
 
-    print(f"  [polygon] ✅ {len(df)} bars downloaded")
+    print(f"  [massive] ✅ {len(df)} bars | {df.index[0].date()} → {df.index[-1].date()}")
     return df
+
+
+# Keep polygon as alias for backward compat
+def download_polygon(symbol: str = "QQQ", years: int = 2) -> pd.DataFrame:
+    return download_massive(symbol, years)
 
 
 def download_yfinance_stitched(symbol: str = "QQQ", years: int = 2) -> pd.DataFrame:
@@ -272,8 +316,8 @@ def load_deep_data(source: str = "yfinance", force_download: bool = False) -> pd
     print(f"\n  Downloading 2yr QQQ 15m data via {source}...")
     if source == "alpaca":
         df = download_alpaca()
-    elif source == "polygon":
-        df = download_polygon()
+    elif source in ("polygon", "massive"):
+        df = download_massive()
     else:
         df = download_yfinance_stitched()
 
@@ -575,7 +619,7 @@ def save_results_json(results: Dict[str, Any]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Deep 2-Year QQQ Backtest Engine")
-    parser.add_argument("--source", choices=["yfinance", "alpaca", "polygon"],
+    parser.add_argument("--source", choices=["yfinance", "alpaca", "polygon", "massive"],
                         default="yfinance", help="Data source (default: yfinance)")
     parser.add_argument("--no-download", action="store_true",
                         help="Use cached CSV only, skip download check")
