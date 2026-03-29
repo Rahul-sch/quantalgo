@@ -15,11 +15,20 @@ import os
 import json
 import argparse
 import itertools
+import time
+from datetime import datetime, timedelta, date
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+
+# Load .env early so API keys are available to all functions
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass
 
 sys.path.insert(0, os.path.dirname(__file__))
 from data_fetcher import download_data, INSTRUMENTS
@@ -111,6 +120,10 @@ class Config:
     macro_veto_longs_below_sma: bool = True   # block longs in macro downtrend
     macro_veto_shorts_above_sma: bool = True  # block shorts in macro uptrend
 
+    # ── Economic Calendar Blackout ──
+    use_blackout_filter: bool = True
+    blackout_minutes: int = 30  # minutes before/after high-impact events
+
 
 CFG = Config()
 
@@ -151,62 +164,97 @@ def apply_friction(
 # 1b. REGIME FILTER MODULE — VIX + Weekly Trend
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def compute_vix_regime(df_15m: pd.DataFrame, vix_threshold: float = 25.0) -> pd.Series:
+def _fetch_vix_yfinance(start_date: str, end_date: str) -> Optional[pd.Series]:
     """
-    Download VIX daily data and map to 15m bars.
-    Returns a boolean Series: True = safe to trade (VIX below threshold).
-    Uses .shift(1) on daily VIX to prevent lookahead bias.
+    Fetch VIX daily closes from yfinance (^VIX index).
+    Used ONLY for VIX regime data — NOT for the 15m price data (which uses Massive).
+    Returns a Series indexed by US/Eastern datetime, or None on failure.
+    FAIL-SAFE: returns None on ANY error.
+    Note: Polygon/Massive free tier does not serve index tickers like I:VIX (403).
+    yfinance is acceptable here since VIX data is: (a) daily, (b) widely available,
+    (c) not subject to Polygon tier restrictions.
     """
     try:
         import yfinance as yf
-
-        # Get date range from 15m data
-        if not isinstance(df_15m.index, pd.DatetimeIndex):
-            idx = pd.to_datetime(df_15m.index, utc=True)
-        else:
-            idx = df_15m.index
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
-        idx_est = idx.tz_convert("US/Eastern")
-
-        start_date = idx_est[0].date()
-        end_date = (idx_est[-1] + pd.Timedelta(days=2)).date()
-
         vix = yf.download(
             "^VIX",
-            start=str(start_date),
-            end=str(end_date),
+            start=start_date,
+            end=end_date,
             interval="1d",
             progress=False,
             auto_adjust=True,
         )
-
         if vix.empty:
-            print("    [regime] VIX data unavailable — skipping VIX filter")
-            return pd.Series(True, index=df_15m.index)
+            return None
+        close = vix["Close"].squeeze()
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        if close.index.tz is None:
+            close.index = pd.to_datetime(close.index).tz_localize("US/Eastern")
+        else:
+            close.index = close.index.tz_convert("US/Eastern")
+        return close
+    except Exception as e:
+        print(f"    [regime] yfinance VIX fetch error: {e}")
+        return None
 
-        # Use closing VIX, shift by 1 day (we only know yesterday's close)
-        vix_close = vix["Close"].squeeze()
-        if isinstance(vix_close, pd.DataFrame):
-            vix_close = vix_close.iloc[:, 0]
+
+def compute_vix_regime(df_15m: pd.DataFrame, vix_threshold: float = 25.0) -> pd.Series:
+    """
+    Fetch VIX daily data via Massive API and map to 15m bars.
+    Returns a boolean Series: True = safe to trade (VIX below threshold).
+    Uses .shift(1) on daily VIX to prevent lookahead bias.
+
+    FAIL-SAFE: If API unavailable, defaults to False (BLOCK ALL TRADES).
+    Never fly blind — if we can't verify VIX is safe, we don't trade.
+    """
+    fail_safe = pd.Series(False, index=df_15m.index)
+
+    try:
+        # Always convert to DatetimeIndex (handles object/string index from CSV)
+        idx = pd.DatetimeIndex(pd.to_datetime(df_15m.index))
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        idx_est = idx.tz_convert("US/Eastern")
+
+        start_date = str(idx_est[0].date())
+        end_date = str((idx_est[-1] + pd.Timedelta(days=2)).date())
+
+        vix_close = _fetch_vix_yfinance(start_date, end_date)
+
+        if vix_close is None or vix_close.empty:
+            print(f"    [regime] ⚠️  VIX data UNAVAILABLE — defaulting to BLOCK ALL TRADES (fail-safe)")
+            return fail_safe
+
+        # shift(1): we only know yesterday's closing VIX
         vix_shifted = vix_close.shift(1)
 
-        # Map daily VIX to 15m index via forward fill
-        vix_daily = pd.Series(vix_shifted.values, index=pd.to_datetime(vix_shifted.index).tz_localize("US/Eastern"))
-        vix_15m = vix_daily.reindex(df_15m.index, method="ffill")
+        # Normalize to naive datetime for reindex
+        vix_idx_naive = vix_shifted.index.tz_localize(None) if vix_shifted.index.tz is not None else vix_shifted.index
+        vix_daily = pd.Series(vix_shifted.values, index=pd.to_datetime(vix_idx_naive))
+
+        df_idx_dt = pd.DatetimeIndex(pd.to_datetime(df_15m.index))
+        if df_idx_dt.tz is None:
+            df_idx_dt = df_idx_dt.tz_localize("UTC")
+        df_idx_naive = df_idx_dt.tz_convert("US/Eastern").tz_localize(None)
+        vix_15m = vix_daily.reindex(df_idx_naive, method="ffill")
 
         safe = vix_15m < vix_threshold
-        safe = safe.fillna(True)  # if no VIX data, default to safe
+        # FAIL-SAFE: any bar with no VIX data → block (False), not allow
+        safe = safe.fillna(False)
+        safe.index = df_15m.index
 
-        n_blocked = (~safe).sum()
-        if n_blocked > 0:
-            print(f"    [regime] VIX filter: blocked {n_blocked} bars (VIX >= {vix_threshold})")
+        n_blocked = int((~safe).sum())
+        n_total = len(safe)
+        print(f"    [regime] VIX filter (threshold={vix_threshold}): "
+              f"{n_blocked}/{n_total} bars blocked "
+              f"({n_blocked/n_total*100:.1f}% of session)")
 
         return safe
 
     except Exception as e:
-        print(f"    [regime] VIX filter error: {e} — skipping")
-        return pd.Series(True, index=df_15m.index)
+        print(f"    [regime] ⚠️  VIX filter CRITICAL ERROR: {e} — defaulting to BLOCK ALL TRADES")
+        return fail_safe
 
 
 def compute_weekly_trend(df_15m: pd.DataFrame, ema_period: int = 10) -> pd.Series:
@@ -246,76 +294,112 @@ def compute_weekly_trend(df_15m: pd.DataFrame, ema_period: int = 10) -> pd.Serie
         return pd.Series(0, index=df_15m.index)
 
 
-def compute_macro_veto(df_15m: pd.DataFrame, cfg: Config) -> pd.Series:
+def _fetch_qqq_monthly(start_date: str, end_date: str) -> Optional[pd.Series]:
     """
-    Top-Down Macro Veto using 20-Month SMA.
-
-    Logic (zero lookahead bias):
-    - Download monthly OHLCV for QQQ going back cfg.macro_sma_period + 6 months
-    - Compute 20-Month SMA on monthly close
-    - Shift by 1 month (.shift(1)) — we only know LAST month's SMA
-    - Map to 15m bars via forward-fill
-    - Returns Series: 1=long_ok/short_blocked, -1=short_ok/long_blocked, 0=neutral
-
-    When price < 20-Month SMA:
-      → Macro downtrend → veto ALL longs (only shorts allowed)
-    When price > 20-Month SMA:
-      → Macro uptrend → veto ALL shorts (only longs allowed)
+    Fetch QQQ monthly closing prices.
+    Primary: Massive/Polygon API (monthly aggregates).
+    Fallback: yfinance monthly (if Polygon fails — free tier rate limits monthly data).
+    Returns a Series indexed by US/Eastern datetime, or None on complete failure.
+    FAIL-SAFE: returns None on ANY error.
     """
+    # Try Massive/Polygon first
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+        api_key = os.environ.get("MASSIVE_API_KEY")
+        if api_key:
+            import urllib.request
+            url = (f"https://api.polygon.io/v2/aggs/ticker/QQQ/range/1/month"
+                   f"/{start_date}/{end_date}?adjusted=true&sort=asc&limit=500&apiKey={api_key}")
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            results = data.get("results", [])
+            if results:
+                dates = pd.to_datetime([r["t"] for r in results], unit="ms", utc=True)
+                closes = [r["c"] for r in results]
+                series = pd.Series(closes, index=dates.tz_convert("US/Eastern"))
+                return series
+    except Exception as e:
+        print(f"    [macro] Massive monthly fetch error: {e} — trying yfinance fallback")
+
+    # Fallback: yfinance monthly (acceptable for monthly macro data — changes rarely)
     try:
         import yfinance as yf
-
-        if not isinstance(df_15m.index, pd.DatetimeIndex):
-            idx = pd.to_datetime(df_15m.index, utc=True)
-        else:
-            idx = df_15m.index
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
-        idx_est = idx.tz_convert("US/Eastern")
-
-        # Fetch enough monthly data (SMA period + buffer)
-        start = (idx_est[0] - pd.DateOffset(months=cfg.macro_sma_period + 6)).date()
-        end = (idx_est[-1] + pd.DateOffset(months=1)).date()
-
         monthly = yf.download(
             "QQQ",
-            start=str(start),
-            end=str(end),
+            start=start_date,
+            end=end_date,
             interval="1mo",
             progress=False,
             auto_adjust=True,
         )
-
-        if monthly.empty or len(monthly) < cfg.macro_sma_period:
-            print(f"    [macro] Insufficient monthly data ({len(monthly)} bars) — skipping veto")
-            return pd.Series(0, index=df_15m.index)
-
+        if monthly.empty:
+            return None
         close = monthly["Close"].squeeze()
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
+        if close.index.tz is None:
+            close.index = pd.to_datetime(close.index).tz_localize("US/Eastern")
+        else:
+            close.index = close.index.tz_convert("US/Eastern")
+        return close
+    except Exception as e:
+        print(f"    [macro] yfinance monthly fallback error: {e}")
+        return None
 
-        # 20-Month SMA, shifted by 1 to prevent lookahead
+
+def compute_macro_veto(df_15m: pd.DataFrame, cfg: Config) -> pd.Series:
+    """
+    Top-Down Macro Veto using 20-Month SMA via Massive API.
+
+    Logic (zero lookahead bias):
+    - Fetch monthly QQQ closes via Massive/Polygon API
+    - Compute 20-Month SMA on monthly close
+    - Shift by 1 month (.shift(1)) — we only know LAST month's SMA
+    - Map to 15m bars via forward-fill
+    - Returns Series: 1=bullish(longs ok), -1=bearish(shorts ok), 0=neutral
+
+    FAIL-SAFE: If API fails, returns 0 (neutral — no veto applied).
+    Macro veto is a permissive filter; a brief API hiccup should not
+    halt trading. Monthly macro regime changes rarely intraday.
+    """
+    try:
+        # Always convert to DatetimeIndex (handles object/string index from CSV)
+        idx = pd.DatetimeIndex(pd.to_datetime(df_15m.index))
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        idx_est = idx.tz_convert("US/Eastern")
+
+        start = str((idx_est[0] - pd.DateOffset(months=cfg.macro_sma_period + 6)).date())
+        end = str((idx_est[-1] + pd.DateOffset(months=1)).date())
+
+        close = _fetch_qqq_monthly(start, end)
+
+        if close is None or close.empty or len(close) < cfg.macro_sma_period:
+            n = 0 if close is None else len(close)
+            print(f"    [macro] ⚠️  Monthly data UNAVAILABLE ({n} bars) — macro veto DISABLED (neutral)")
+            return pd.Series(0, index=df_15m.index)
+
+        # 20-Month SMA, shift(1) = no lookahead
         sma_20m = close.rolling(cfg.macro_sma_period).mean().shift(1)
 
-        # Macro regime: +1 = above SMA (bullish), -1 = below SMA (bearish)
         macro_regime = pd.Series(0, index=sma_20m.index, dtype=int)
         macro_regime[close > sma_20m] = 1
         macro_regime[close <= sma_20m] = -1
 
-        # Localize monthly index
-        if monthly.index.tz is None:
-            monthly_idx = pd.to_datetime(monthly.index).tz_localize("US/Eastern")
-        else:
-            monthly_idx = pd.to_datetime(monthly.index).tz_convert("US/Eastern")
+        # Normalize monthly index to naive for reindex
+        m_idx_naive = close.index.tz_localize(None) if close.index.tz is not None else close.index
+        macro_series = pd.Series(macro_regime.values, index=pd.to_datetime(m_idx_naive))
 
-        macro_series = pd.Series(macro_regime.values, index=monthly_idx)
+        df_idx_dt = pd.DatetimeIndex(pd.to_datetime(df_15m.index))
+        if df_idx_dt.tz is None:
+            df_idx_dt = df_idx_dt.tz_localize("UTC")
+        df_idx_naive = df_idx_dt.tz_convert("US/Eastern").tz_localize(None)
+        macro_15m = macro_series.reindex(df_idx_naive, method="ffill").fillna(0).astype(int)
+        macro_15m.index = df_15m.index
 
-        # Forward-fill to 15m bars
-        macro_15m = macro_series.reindex(df_15m.index, method="ffill").fillna(0).astype(int)
-
-        # Report
-        n_bull = (macro_15m == 1).sum()
-        n_bear = (macro_15m == -1).sum()
+        n_bull = int((macro_15m == 1).sum())
+        n_bear = int((macro_15m == -1).sum())
         pct_bull = n_bull / len(macro_15m) * 100 if len(macro_15m) > 0 else 0
         print(f"    [macro] 20-Month SMA veto: "
               f"{n_bull} bars BULLISH ({pct_bull:.0f}%) | "
@@ -324,8 +408,281 @@ def compute_macro_veto(df_15m: pd.DataFrame, cfg: Config) -> pd.Series:
         return macro_15m
 
     except Exception as e:
-        print(f"    [macro] Veto error: {e} — skipping")
+        print(f"    [macro] ⚠️  Veto CRITICAL ERROR: {e} — returning neutral (no veto)")
         return pd.Series(0, index=df_15m.index)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1c. ECONOMIC CALENDAR BLACKOUT — High-Impact Event Filter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BLACKOUT_CACHE_PATH = os.path.join(os.path.dirname(__file__), "data", "blackout_windows.json")
+BLACKOUT_CACHE_TTL = 86400  # 24 hours in seconds
+
+
+def _get_hardcoded_blackout_events(lookback_days: int = 90) -> List[datetime]:
+    """
+    Fallback: generate known high-impact US economic event dates.
+    Covers NFP (first Friday of month), FOMC (8 per year), CPI (~12th of month).
+    Returns list of naive datetimes in US/Eastern.
+    """
+    today = date.today()
+    start = today - timedelta(days=lookback_days)
+    end = today + timedelta(days=lookback_days)
+
+    events: List[datetime] = []
+
+    # FOMC meeting dates 2023-2026 (approximate; 8 per year)
+    fomc_dates = [
+        # 2024
+        date(2024, 1, 31), date(2024, 3, 20), date(2024, 5, 1),
+        date(2024, 6, 12), date(2024, 7, 31), date(2024, 9, 18),
+        date(2024, 11, 7), date(2024, 12, 18),
+        # 2025
+        date(2025, 1, 29), date(2025, 3, 19), date(2025, 5, 7),
+        date(2025, 6, 18), date(2025, 7, 30), date(2025, 9, 17),
+        date(2025, 11, 5), date(2025, 12, 17),
+        # 2026
+        date(2026, 1, 28), date(2026, 3, 18), date(2026, 4, 29),
+        date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
+        date(2026, 11, 4), date(2026, 12, 16),
+    ]
+    for d in fomc_dates:
+        if start <= d <= end:
+            events.append(datetime(d.year, d.month, d.day, 14, 0))  # 2:00 PM ET
+
+    # NFP: first Friday of each month, 8:30 AM
+    current = date(start.year, start.month, 1)
+    while current <= end:
+        first_friday = current
+        while first_friday.weekday() != 4:  # 4 = Friday
+            first_friday += timedelta(days=1)
+        if start <= first_friday <= end:
+            events.append(datetime(first_friday.year, first_friday.month, first_friday.day, 8, 30))
+        if current.month == 12:
+            current = date(current.year + 1, 1, 1)
+        else:
+            current = date(current.year, current.month + 1, 1)
+
+    # CPI: ~12th of each month, 8:30 AM
+    current = date(start.year, start.month, 1)
+    while current <= end:
+        cpi_day = date(current.year, current.month, 12)
+        while cpi_day.weekday() >= 5:
+            cpi_day += timedelta(days=1)
+        if start <= cpi_day <= end:
+            events.append(datetime(cpi_day.year, cpi_day.month, cpi_day.day, 8, 30))
+        if current.month == 12:
+            current = date(current.year + 1, 1, 1)
+        else:
+            current = date(current.year, current.month + 1, 1)
+
+    return events
+
+
+def get_blackout_windows(lookback_days: int = 90, blackout_minutes: int = 30) -> List[Tuple[datetime, datetime]]:
+    """
+    Fetch high-impact US economic events and return blackout windows.
+    Each window = (start_dt, end_dt) = event_time +/- blackout_minutes.
+
+    Sources:
+    1. Finnhub API (if FINNHUB_API_KEY env var set)
+    2. Hardcoded fallback (NFP, FOMC, CPI)
+    3. Cached to data/blackout_windows.json with 24h TTL
+    """
+    os.makedirs(os.path.dirname(BLACKOUT_CACHE_PATH), exist_ok=True)
+
+    # Check cache
+    if os.path.exists(BLACKOUT_CACHE_PATH):
+        try:
+            with open(BLACKOUT_CACHE_PATH) as f:
+                cached = json.load(f)
+            age = time.time() - cached.get("timestamp", 0)
+            if age < BLACKOUT_CACHE_TTL:
+                windows = [(datetime.fromisoformat(w[0]), datetime.fromisoformat(w[1]))
+                           for w in cached["windows"]]
+                print(f"    [blackout] Using cached blackout windows ({len(windows)} events, age={age/3600:.1f}h)")
+                return windows
+        except Exception as e:
+            print(f"    [blackout] Cache read error: {e} — regenerating")
+
+    event_times: List[datetime] = []
+    source = "hardcoded"
+
+    # Try Finnhub API
+    finnhub_key = os.environ.get("FINNHUB_API_KEY")
+    if finnhub_key:
+        try:
+            import urllib.request
+            today = date.today()
+            from_date = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            to_date = (today + timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            url = (f"https://finnhub.io/api/v1/calendar/economic"
+                   f"?from={from_date}&to={to_date}&token={finnhub_key}")
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            eco_events = data.get("economicCalendar", [])
+            for ev in eco_events:
+                if ev.get("country") != "US":
+                    continue
+                impact = str(ev.get("impact", "")).lower()
+                if impact not in ("high", "3"):
+                    continue
+                ev_time_str = ev.get("time") or ev.get("date")
+                if ev_time_str:
+                    try:
+                        import pytz
+                        ev_dt = datetime.fromisoformat(ev_time_str.replace("Z", "+00:00"))
+                        et = pytz.timezone("US/Eastern")
+                        ev_dt_et = ev_dt.astimezone(et).replace(tzinfo=None)
+                        event_times.append(ev_dt_et)
+                    except Exception:
+                        pass
+            if event_times:
+                source = "finnhub"
+                print(f"    [blackout] Fetched {len(event_times)} high-impact events from Finnhub")
+        except Exception as e:
+            print(f"    [blackout] Finnhub API error: {e} — falling back to hardcoded")
+            event_times = []
+
+    # Fallback to hardcoded
+    if not event_times:
+        event_times = _get_hardcoded_blackout_events(lookback_days)
+        source = "hardcoded"
+        print(f"    [blackout] Using {len(event_times)} hardcoded economic event dates")
+
+    # Build windows: event +/- blackout_minutes
+    delta = timedelta(minutes=blackout_minutes)
+    windows = [(dt - delta, dt + delta) for dt in event_times]
+
+    # Cache result
+    try:
+        cache_data = {
+            "timestamp": time.time(),
+            "source": source,
+            "windows": [(w[0].isoformat(), w[1].isoformat()) for w in windows]
+        }
+        with open(BLACKOUT_CACHE_PATH, "w") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception as e:
+        print(f"    [blackout] Cache write error: {e}")
+
+    return windows
+
+
+def apply_blackout_filter(signals_df: pd.DataFrame, blackout_windows: List[Tuple[datetime, datetime]]) -> pd.DataFrame:
+    """
+    Set signal=0 for any bar whose timestamp falls within a blackout window.
+    Expects signals_df to have a DatetimeIndex.
+    Returns filtered DataFrame.
+    """
+    if not blackout_windows:
+        return signals_df
+
+    df = signals_df.copy()
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    # Convert to naive ET for comparison
+    try:
+        ts = df.index
+        if ts.tz is not None:
+            ts_naive = ts.tz_convert("US/Eastern").tz_localize(None)
+        else:
+            ts_naive = ts
+    except Exception:
+        ts_naive = df.index
+
+    blackout_mask = pd.Series(False, index=df.index)
+    for start_dt, end_dt in blackout_windows:
+        s = start_dt.replace(tzinfo=None) if (hasattr(start_dt, 'tzinfo') and start_dt.tzinfo) else start_dt
+        e = end_dt.replace(tzinfo=None) if (hasattr(end_dt, 'tzinfo') and end_dt.tzinfo) else end_dt
+        blackout_mask |= (ts_naive >= s) & (ts_naive <= e)
+
+    n_blocked = blackout_mask.sum()
+    if n_blocked > 0 and "signal" in df.columns:
+        df.loc[blackout_mask, "signal"] = 0
+        print(f"    [blackout] Blocked {n_blocked} bars during economic events")
+
+    return df
+
+
+# Module-level cache for live paper trader
+_LIVE_BLACKOUT_WINDOWS: List[Tuple[datetime, datetime]] = []
+
+
+def refresh_blackout_calendar(cfg: Optional[Config] = None) -> List[Tuple[datetime, datetime]]:
+    """
+    Called once at paper_trader.py startup (or 08:00 AM refresh).
+    Fetches THIS WEEK's high-impact economic calendar via Finnhub API.
+    Falls back to algorithmic computation if API unavailable.
+
+    Logs exactly what events were found today so the trader can verify.
+    Updates the module-level _LIVE_BLACKOUT_WINDOWS cache.
+    """
+    global _LIVE_BLACKOUT_WINDOWS
+
+    blackout_min = cfg.blackout_minutes if cfg else 30
+    today = date.today()
+    # Fetch today + 7 days for the week ahead
+    windows = get_blackout_windows(lookback_days=0, blackout_minutes=blackout_min)
+    # Override cache TTL for live use: always get fresh windows for today
+    # Re-fetch with explicit range covering this week
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+        finnhub_key = os.environ.get("FINNHUB_API_KEY")
+        import urllib.request
+        from_date = today.strftime("%Y-%m-%d")
+        to_date = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+        if finnhub_key:
+            url = (f"https://finnhub.io/api/v1/calendar/economic"
+                   f"?from={from_date}&to={to_date}&token={finnhub_key}")
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            eco_events = data.get("economicCalendar", [])
+            event_times = []
+            for ev in eco_events:
+                if ev.get("country") != "US":
+                    continue
+                impact = str(ev.get("impact", "")).lower()
+                if impact not in ("high", "3"):
+                    continue
+                ev_time_str = ev.get("time") or ev.get("date")
+                if ev_time_str:
+                    try:
+                        import pytz
+                        ev_dt = datetime.fromisoformat(ev_time_str.replace("Z", "+00:00"))
+                        et = pytz.timezone("US/Eastern")
+                        ev_dt_et = ev_dt.astimezone(et).replace(tzinfo=None)
+                        event_times.append(ev_dt_et)
+                    except Exception:
+                        pass
+            if event_times:
+                delta = timedelta(minutes=blackout_min)
+                windows = [(dt - delta, dt + delta) for dt in event_times]
+                print(f"📅 Fetched {len(event_times)} high-impact events from Finnhub (live)")
+    except Exception as e:
+        print(f"    [blackout] Live refresh error: {e} — using cached/computed windows")
+
+    _LIVE_BLACKOUT_WINDOWS = windows
+
+    # Log today's blackouts so trader can verify
+    today_windows = [
+        (s, e) for s, e in windows
+        if s.date() == today or e.date() == today
+    ]
+    if today_windows:
+        today_str = ", ".join(
+            f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}"
+            for s, e in sorted(today_windows)
+        )
+        print(f"📅 Blackout windows TODAY ({today}): [{today_str}] (±{blackout_min}min around events)")
+    else:
+        print(f"📅 No high-impact events scheduled today ({today}) — no blackouts")
+
+    return windows
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -505,6 +862,39 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         df_ind["macro_regime"] = compute_macro_veto(df, cfg)
     else:
         df_ind["macro_regime"] = 0  # 0 = no veto, allow both directions
+
+    # Economic Calendar Blackout
+    if cfg.use_blackout_filter:
+        blackout_windows = get_blackout_windows(
+            lookback_days=90, blackout_minutes=cfg.blackout_minutes
+        )
+        if blackout_windows:
+            try:
+                idx = df.index
+                if not isinstance(idx, pd.DatetimeIndex):
+                    idx = pd.to_datetime(idx, utc=True)
+                if idx.tz is not None:
+                    ts_naive = idx.tz_convert("US/Eastern").tz_localize(None)
+                else:
+                    ts_naive = idx
+
+                blackout_mask = pd.Series(False, index=df.index)
+                for start_dt, end_dt in blackout_windows:
+                    s = start_dt.replace(tzinfo=None) if (hasattr(start_dt, 'tzinfo') and start_dt.tzinfo) else start_dt
+                    e = end_dt.replace(tzinfo=None) if (hasattr(end_dt, 'tzinfo') and end_dt.tzinfo) else end_dt
+                    blackout_mask |= (ts_naive >= s) & (ts_naive <= e)
+
+                df_ind["in_blackout"] = blackout_mask.values
+                n_blackout = blackout_mask.sum()
+                if n_blackout > 0:
+                    print(f"    [blackout] {n_blackout} bars flagged during economic events")
+            except Exception as e:
+                print(f"    [blackout] Error applying blackout filter: {e}")
+                df_ind["in_blackout"] = False
+        else:
+            df_ind["in_blackout"] = False
+    else:
+        df_ind["in_blackout"] = False
 
     return df_ind
 

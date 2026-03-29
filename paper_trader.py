@@ -39,6 +39,7 @@ from quant_engine import (
     generate_signals,
     apply_friction,
     compute_indicators,
+    refresh_blackout_calendar,
 )
 
 # Ensure QQQ is available
@@ -645,6 +646,13 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("  🏛️  INSTITUTIONAL PAPER TRADER — QQQ 15m")
     print("=" * 60)
+
+    # ── Dynamic Economic Calendar: fetch today's high-impact schedule ──
+    print("\n  📡 Fetching today's economic calendar...")
+    try:
+        refresh_blackout_calendar(LIVE_CONFIG)
+    except Exception as e:
+        print(f"  ⚠️  Calendar refresh failed: {e} — blackout filter will use cached/computed windows")
 
     # Check market hours (warn but don't block — useful for testing)
     if not is_market_hours():
