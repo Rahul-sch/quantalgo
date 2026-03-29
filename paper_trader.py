@@ -41,6 +41,7 @@ from quant_engine import (
     compute_indicators,
     refresh_blackout_calendar,
 )
+from notifier import alert_new_trade, alert_session_summary, alert_daily_limit
 
 # Ensure QQQ is available
 if "QQQ" not in INSTRUMENTS:
@@ -207,6 +208,10 @@ def update_daily_pnl(pnl: float) -> None:
     if state["daily_pnl"] <= -MAX_DAILY_LOSS:
         state["halted"] = True
         print(f"\n  🛑 DAILY LOSS LIMIT HIT: ${state['daily_pnl']:.2f} — TRADING HALTED FOR TODAY")
+        try:
+            alert_daily_limit()
+        except Exception:
+            pass
     save_daily_state(state)
 
 
@@ -619,7 +624,8 @@ def main() -> None:
     parser.add_argument("--pnl", action="store_true", help="Show P&L summary")
     parser.add_argument("--show-trades", action="store_true", help="Show full trade log")
     parser.add_argument("--update", action="store_true", help="Update open trades vs current prices")
-    parser.add_argument("--reset", action="store_true", help="Clear all paper trades")
+    parser.add_argument("--reset",   action="store_true", help="Clear all paper trades")
+    parser.add_argument("--summary", action="store_true", help="Send AM session summary via Telegram")
     args = parser.parse_args()
 
     if args.reset:
@@ -627,6 +633,12 @@ def main() -> None:
             if os.path.exists(f):
                 os.remove(f)
         print("  🗑️  All paper trades cleared.")
+        return
+
+    if args.summary:
+        print("  📊 Sending AM session summary to Telegram...")
+        alert_session_summary()
+        show_pnl_summary()
         return
 
     if args.show_trades:
@@ -663,10 +675,34 @@ def main() -> None:
     # Scan for new signals
     new_signals = scan_for_signals(verbose=True)
 
-    # Log new signals
+    # Log new signals + fire Telegram alerts
     for signal in new_signals:
         log_trade(signal)
         append_csv_row(signal)
+        # Fetch live VIX + macro for the alert payload
+        try:
+            import yfinance as yf
+            vix_data = yf.download("^VIX", period="2d", interval="1d",
+                                    progress=False, auto_adjust=True)
+            vix_now = float(vix_data["Close"].iloc[-1]) if not vix_data.empty else None
+        except Exception:
+            vix_now = None
+        try:
+            qqq_monthly = yf.download("QQQ", period="2y", interval="1mo",
+                                       progress=False, auto_adjust=True)
+            if not qqq_monthly.empty and len(qqq_monthly) >= 20:
+                close = qqq_monthly["Close"].squeeze()
+                sma20 = float(close.rolling(20).mean().iloc[-1])
+                price = float(close.iloc[-1])
+                macro_pct = (price - sma20) / sma20 * 100
+            else:
+                macro_pct = None
+        except Exception:
+            macro_pct = None
+        try:
+            alert_new_trade(signal, vix=vix_now, macro_pct=macro_pct)
+        except Exception as e:
+            print(f"  [alert] Telegram notification failed: {e}")
 
     # Update existing open trades
     update_open_trades(verbose=True)
