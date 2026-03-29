@@ -91,6 +91,12 @@ class Config:
     opt_rr: List[float] = field(default_factory=lambda: [1.5, 2.0, 2.5, 3.0])
     opt_disp: List[float] = field(default_factory=lambda: [1.0, 1.3])
 
+    # ── Regime Filters ──
+    use_vix_filter: bool = True
+    vix_threshold: float = 25.0     # halt trading when VIX >= this level
+    use_weekly_trend_filter: bool = True
+    weekly_ema_period: int = 10     # weekly EMA period for trend confirmation
+
 
 CFG = Config()
 
@@ -125,6 +131,105 @@ def apply_friction(
             adj_exit = exit_price * (1 + slip_pct)
 
     return adj_entry, adj_exit, cfg.commission_round_trip
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1b. REGIME FILTER MODULE — VIX + Weekly Trend
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_vix_regime(df_15m: pd.DataFrame, vix_threshold: float = 25.0) -> pd.Series:
+    """
+    Download VIX daily data and map to 15m bars.
+    Returns a boolean Series: True = safe to trade (VIX below threshold).
+    Uses .shift(1) on daily VIX to prevent lookahead bias.
+    """
+    try:
+        import yfinance as yf
+
+        # Get date range from 15m data
+        if not isinstance(df_15m.index, pd.DatetimeIndex):
+            idx = pd.to_datetime(df_15m.index, utc=True)
+        else:
+            idx = df_15m.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        idx_est = idx.tz_convert("US/Eastern")
+
+        start_date = idx_est[0].date()
+        end_date = (idx_est[-1] + pd.Timedelta(days=2)).date()
+
+        vix = yf.download(
+            "^VIX",
+            start=str(start_date),
+            end=str(end_date),
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+        )
+
+        if vix.empty:
+            print("    [regime] VIX data unavailable — skipping VIX filter")
+            return pd.Series(True, index=df_15m.index)
+
+        # Use closing VIX, shift by 1 day (we only know yesterday's close)
+        vix_close = vix["Close"].squeeze()
+        if isinstance(vix_close, pd.DataFrame):
+            vix_close = vix_close.iloc[:, 0]
+        vix_shifted = vix_close.shift(1)
+
+        # Map daily VIX to 15m index via forward fill
+        vix_daily = pd.Series(vix_shifted.values, index=pd.to_datetime(vix_shifted.index).tz_localize("US/Eastern"))
+        vix_15m = vix_daily.reindex(df_15m.index, method="ffill")
+
+        safe = vix_15m < vix_threshold
+        safe = safe.fillna(True)  # if no VIX data, default to safe
+
+        n_blocked = (~safe).sum()
+        if n_blocked > 0:
+            print(f"    [regime] VIX filter: blocked {n_blocked} bars (VIX >= {vix_threshold})")
+
+        return safe
+
+    except Exception as e:
+        print(f"    [regime] VIX filter error: {e} — skipping")
+        return pd.Series(True, index=df_15m.index)
+
+
+def compute_weekly_trend(df_15m: pd.DataFrame, ema_period: int = 10) -> pd.Series:
+    """
+    Resample 15m to weekly, compute EMA slope for macro trend direction.
+    Returns Series: 1 (bullish), -1 (bearish), 0 (flat/ambiguous).
+    Uses .shift(1) on weekly bars to prevent lookahead bias.
+    Only trade longs in bullish regime, shorts in bearish regime.
+    """
+    try:
+        df_work = df_15m.copy()
+        if not isinstance(df_work.index, pd.DatetimeIndex):
+            df_work.index = pd.to_datetime(df_work.index, utc=True)
+        if df_work.index.tz is None:
+            try:
+                df_work.index = df_work.index.tz_localize("US/Eastern")
+            except Exception:
+                df_work.index = df_work.index.tz_localize("UTC").tz_convert("US/Eastern")
+        else:
+            df_work.index = df_work.index.tz_convert("US/Eastern")
+
+        # Resample to weekly
+        df_weekly = df_work["Close"].resample("W").last().dropna()
+        ema_weekly = df_weekly.ewm(span=ema_period, adjust=False).mean()
+        slope = ema_weekly.diff().shift(1)  # shift to prevent lookahead
+
+        trend = pd.Series(0, index=slope.index, dtype=int)
+        trend[slope > 0] = 1
+        trend[slope < 0] = -1
+
+        # Map back to 15m
+        trend_15m = trend.reindex(df_work.index, method="ffill").fillna(0).astype(int)
+        return trend_15m
+
+    except Exception as e:
+        print(f"    [regime] Weekly trend error: {e} — skipping")
+        return pd.Series(0, index=df_15m.index)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -286,6 +391,19 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     else:
         df_ind["htf_signal"] = 0
 
+    # ── Regime filters ──
+    # VIX filter: block trading when fear index is too high
+    if cfg.use_vix_filter:
+        df_ind["vix_safe"] = compute_vix_regime(df, cfg.vix_threshold)
+    else:
+        df_ind["vix_safe"] = True
+
+    # Weekly trend filter: only trade in direction of macro trend
+    if cfg.use_weekly_trend_filter:
+        df_ind["weekly_trend"] = compute_weekly_trend(df, cfg.weekly_ema_period)
+    else:
+        df_ind["weekly_trend"] = 0  # 0 = no filter, allow both directions
+
     return df_ind
 
 
@@ -356,9 +474,11 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
     is_disp = ind["is_displacement"].values
     in_session = ind["in_session"].values
     htf = ind["htf_signal"].values
+    vix_safe = ind["vix_safe"].values.astype(bool)
+    weekly_trend = ind["weekly_trend"].values
 
     # Diagnostics
-    _skip = {"atr": 0, "session": 0, "adx": 0, "disp": 0, "htf": 0, "rvol": 0, "no_fvg": 0, "passed": 0}
+    _skip = {"atr": 0, "session": 0, "adx": 0, "regime": 0, "disp": 0, "htf": 0, "rvol": 0, "no_fvg": 0, "passed": 0}
 
     # Active FVG tracking (ring buffer for efficiency)
     active_bull_fvgs = []  # (bar, top, bot)
@@ -390,6 +510,17 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
             active_bear_fvgs = [(b, t, bt) for b, t, bt in active_bear_fvgs if i - b <= cfg.fvg_max_age]
             continue
 
+        # ── Regime filter: skip if VIX too high ──
+        if cfg.use_vix_filter and not vix_safe[i]:
+            _skip["regime"] += 1
+            if not np.isnan(bull_fvg_top.iloc[i]):
+                active_bull_fvgs.append((i, float(bull_fvg_top.iloc[i]), float(bull_fvg_bot.iloc[i])))
+            if not np.isnan(bear_fvg_top.iloc[i]):
+                active_bear_fvgs.append((i, float(bear_fvg_top.iloc[i]), float(bear_fvg_bot.iloc[i])))
+            active_bull_fvgs = [(b, t, bt) for b, t, bt in active_bull_fvgs if i - b <= cfg.fvg_max_age]
+            active_bear_fvgs = [(b, t, bt) for b, t, bt in active_bear_fvgs if i - b <= cfg.fvg_max_age]
+            continue
+
         _skip["passed"] += 1
 
         # Track FVGs (use .iloc to avoid FutureWarning)
@@ -406,6 +537,9 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
         if trend[i] == 1:
             # HTF filter: only long if 1H EMA bullish (or filter disabled)
             if cfg.use_htf_filter and htf[i] < 0:
+                continue
+            # Weekly trend filter: only long if weekly trend is bullish or flat
+            if cfg.use_weekly_trend_filter and weekly_trend[i] == -1:
                 continue
 
             # Find drawn liquidity (nearest swing high above)
@@ -453,6 +587,9 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
         elif trend[i] == -1:
             if cfg.use_htf_filter and htf[i] > 0:
                 continue
+            # Weekly trend filter: only short if weekly trend is bearish or flat
+            if cfg.use_weekly_trend_filter and weekly_trend[i] == 1:
+                continue
 
             drawn_liq = None
             for j in range(i - 1, max(i - 50, 0), -1):
@@ -495,7 +632,7 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
     # Print diagnostics
     total_bars = len(df) - 30
     print(f"    Filter diagnostics ({total_bars} bars scanned):")
-    print(f"      Skipped — ATR invalid: {_skip['atr']} | Session: {_skip['session']} | ADX<{cfg.adx_threshold}: {_skip['adx']}")
+    print(f"      Skipped — ATR: {_skip['atr']} | Session: {_skip['session']} | ADX<{cfg.adx_threshold}: {_skip['adx']} | Regime(VIX/Weekly): {_skip['regime']}")
     print(f"      Signals generated: {len(signals)}")
 
     return signals
@@ -883,6 +1020,9 @@ def main():
     parser.add_argument("--no-htf", action="store_true", help="Disable 1H EMA filter")
     parser.add_argument("--no-adx", action="store_true", help="Disable ADX filter")
     parser.add_argument("--no-rvol", action="store_true", help="Disable RVOL filter")
+    parser.add_argument("--no-vix", action="store_true", help="Disable VIX regime filter")
+    parser.add_argument("--no-weekly", action="store_true", help="Disable weekly trend filter")
+    parser.add_argument("--vix-threshold", type=float, default=25.0, help="VIX threshold (default: 25)")
     parser.add_argument("--atr-sl", type=float, default=None)
     parser.add_argument("--rr", type=float, default=None)
     parser.add_argument("--tf", type=str, default="15m", help="Timeframe: 5m, 15m, 1h (default: 15m)")
@@ -897,6 +1037,12 @@ def main():
         cfg.use_adx_filter = False
     if args.no_rvol:
         cfg.use_rvol_filter = False
+    if args.no_vix:
+        cfg.use_vix_filter = False
+    if args.no_weekly:
+        cfg.use_weekly_trend_filter = False
+    if args.vix_threshold:
+        cfg.vix_threshold = args.vix_threshold
     if args.atr_sl:
         cfg.atr_multiplier_sl = args.atr_sl
     if args.rr:

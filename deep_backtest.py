@@ -65,6 +65,11 @@ LIVE_CONFIG = Config(
     adx_threshold=18.0,
     use_rvol_filter=True,
     rvol_multiplier=1.2,
+    # Regime filters
+    use_vix_filter=True,
+    vix_threshold=25.0,
+    use_weekly_trend_filter=True,
+    weekly_ema_period=10,
     etf_slippage_pct=0.00005,
     commission_round_trip=2.40,
     initial_capital=10000.0,
