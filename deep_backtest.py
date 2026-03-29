@@ -185,8 +185,10 @@ def download_polygon(symbol: str = "QQQ", years: int = 2) -> pd.DataFrame:
 
 def download_yfinance_stitched(symbol: str = "QQQ", years: int = 2) -> pd.DataFrame:
     """
-    Download 2yr 15m data via yfinance by stitching multiple 60-day chunks.
-    yfinance limits 15m to 60-day windows — we fetch sequentially and merge.
+    Download QQQ 15m data via yfinance.
+    ⚠️  HARD LIMIT: Yahoo Finance only provides 15m data for the last 60 days.
+    For 2yr deep backtest, use --source alpaca or --source polygon instead.
+    This function will only return ~60 days regardless of years parameter.
     """
     try:
         import yfinance as yf
@@ -455,6 +457,21 @@ def print_robustness_matrix(results: Dict[str, Any]) -> None:
     windows = results["windows"]
     profitable = sum(1 for w in windows if w["profitable"])
     total = len(windows)
+
+    if total == 0:
+        print("\n  ❌ NO WINDOWS PROCESSED")
+        print("  Cause: Insufficient historical data.")
+        print("  Fix:   Use Alpaca or Polygon for 2yr history:")
+        print("         python3 deep_backtest.py --source alpaca")
+        print("\n  Setup:")
+        print("  1. Sign up free at https://alpaca.markets")
+        print("  2. Generate Paper Trading API keys")
+        print("  3. Add to .env file:")
+        print("     ALPACA_API_KEY=your_key_id")
+        print("     ALPACA_SECRET_KEY=your_secret_key")
+        print("  4. Run: python3 deep_backtest.py --source alpaca")
+        return
+
     robust = profitable / total >= 0.625  # 5/8 threshold
 
     print("\n" + "═" * 75)
