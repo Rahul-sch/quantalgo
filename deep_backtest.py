@@ -56,7 +56,7 @@ DEEP_CACHE = os.path.join(DATA_DIR, "QQQ_15m_2yr.csv")
 # Live-ready params from walk-forward validation
 LIVE_CONFIG = Config(
     symbols=["QQQ"],
-    atr_multiplier_sl=0.5,
+    atr_multiplier_sl=1.0,  # Wider stop: 1.0x ATR
     rr_ratio=2.5,
     displacement_threshold=1.0,
     session_filter=True,
@@ -661,11 +661,16 @@ def main():
             print(f"  ❌ No cache found at {DEEP_CACHE}. Run without --no-download first.")
             sys.exit(1)
         df = pd.read_csv(DEEP_CACHE, index_col=0, parse_dates=True)
+        # Ensure DatetimeIndex with timezone
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, utc=True)
         if df.index.tz is None:
             try:
                 df.index = df.index.tz_localize("US/Eastern")
             except Exception:
                 df.index = df.index.tz_localize("UTC").tz_convert("US/Eastern")
+        else:
+            df.index = df.index.tz_convert("US/Eastern")
         print(f"  [cache] Loaded {len(df)} bars from {DEEP_CACHE}")
     else:
         df = load_deep_data(source=args.source, force_download=args.force_download)

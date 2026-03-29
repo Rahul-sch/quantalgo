@@ -50,7 +50,7 @@ class Config:
 
     # ── Strategy Parameters ──
     atr_period: int = 14
-    atr_multiplier_sl: float = 0.5
+    atr_multiplier_sl: float = 1.0  # Wider stop: 1.0x ATR (was 0.5x)
     rr_ratio: float = 3.0  # must overcome friction — need home runs
     displacement_threshold: float = 1.0
     swing_lookback: int = 10
@@ -63,8 +63,12 @@ class Config:
     session_filter: bool = True
     am_start: int = 570         # 9:30 in minutes
     am_end: int = 690           # 11:30
-    pm_start: int = 9999        # PM session DISABLED — set to unreachable value
+    pm_start: int = 9999        # PM session DISABLED
     pm_end: int = 9999          # PM session DISABLED
+
+    # ── Retest Entry Logic ──
+    use_retest_entry: bool = True   # Wait for price to pull back into FVG (limit order)
+    retest_max_bars: int = 5        # Max bars to wait for retest after FVG forms
 
     # ── Confluence: 1H EMA ──
     ema_period: int = 20
@@ -454,13 +458,25 @@ def find_swings_vectorized(df: pd.DataFrame, lookback: int = 10) -> Tuple[pd.Ser
 
 def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
     """
-    Generate continuation signals with all filters applied.
-    Pre-computes everything vectorized, then does a single pass for FVG matching.
+    Generate continuation signals using RETEST ENTRY logic.
+
+    Strategy:
+    1. Detect FVG formation on displacement candle
+    2. ARM a limit order at the FVG edge (top for longs, bottom for shorts)
+    3. Only ENTER if price pulls back INTO the FVG within retest_max_bars
+    4. Entry = FVG edge (not market close) — much better fill price
+    5. Stop = 1.0x ATR below/above entry (wider, survives noise)
+    6. Target = entry +/- (risk * rr_ratio)
+
+    Why retest entry is better:
+    - Avoids chasing the initial displacement candle (worst entry)
+    - Enters at known support/resistance level (FVG boundary)
+    - Higher RR because entry is closer to the true support
+    - Eliminates most false breakouts that immediately reverse
     """
     if len(df) < 50:
         return []
 
-    # Vectorized pre-computation
     ind = compute_indicators(df, cfg)
     bull_fvg_top, bull_fvg_bot, bear_fvg_top, bear_fvg_bot = detect_fvgs_vectorized(df)
     swing_highs, swing_lows = find_swings_vectorized(df, cfg.swing_lookback)
@@ -473,171 +489,185 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
     trend = ind["trend"].values
     adx = ind["adx"].values
     rvol = ind["rvol"].values
-    is_disp = ind["is_displacement"].values
     in_session = ind["in_session"].values
     htf = ind["htf_signal"].values
     vix_safe = ind["vix_safe"].values.astype(bool)
     weekly_trend = ind["weekly_trend"].values
 
-    # Diagnostics
-    _skip = {"atr": 0, "session": 0, "adx": 0, "regime": 0, "disp": 0, "htf": 0, "rvol": 0, "no_fvg": 0, "passed": 0}
+    _skip = {"atr": 0, "session": 0, "adx": 0, "regime": 0,
+             "no_retest": 0, "invalidated": 0, "passed": 0}
 
-    # Active FVG tracking (ring buffer for efficiency)
-    active_bull_fvgs = []  # (bar, top, bot)
-    active_bear_fvgs = []
+    # armed_bull / armed_bear: fvg_bar -> (limit_price, fvg_other_edge, armed_bar,
+    #                                       drawn_liq, atr_at_arm, adx_at_arm, rvol_at_arm)
+    armed_bull: Dict[int, tuple] = {}
+    armed_bear: Dict[int, tuple] = {}
+    used_bars: set = set()
 
     for i in range(30, len(df)):
-        # ── Pre-filter: skip quickly ──
         if np.isnan(atr[i]) or atr[i] <= 0:
             _skip["atr"] += 1
             continue
-        if not in_session[i]:
-            _skip["session"] += 1
-            # Still track FVGs even outside session
-            if not np.isnan(bull_fvg_top.iloc[i]):
-                active_bull_fvgs.append((i, float(bull_fvg_top.iloc[i]), float(bull_fvg_bot.iloc[i])))
-            if not np.isnan(bear_fvg_top.iloc[i]):
-                active_bear_fvgs.append((i, float(bear_fvg_top.iloc[i]), float(bear_fvg_bot.iloc[i])))
-            active_bull_fvgs = [(b, t, bt) for b, t, bt in active_bull_fvgs if i - b <= cfg.fvg_max_age]
-            active_bear_fvgs = [(b, t, bt) for b, t, bt in active_bear_fvgs if i - b <= cfg.fvg_max_age]
-            continue
-        if adx[i] < cfg.adx_threshold:
-            _skip["adx"] += 1
-            # Still track FVGs
-            if not np.isnan(bull_fvg_top.iloc[i]):
-                active_bull_fvgs.append((i, float(bull_fvg_top.iloc[i]), float(bull_fvg_bot.iloc[i])))
-            if not np.isnan(bear_fvg_top.iloc[i]):
-                active_bear_fvgs.append((i, float(bear_fvg_top.iloc[i]), float(bear_fvg_bot.iloc[i])))
-            active_bull_fvgs = [(b, t, bt) for b, t, bt in active_bull_fvgs if i - b <= cfg.fvg_max_age]
-            active_bear_fvgs = [(b, t, bt) for b, t, bt in active_bear_fvgs if i - b <= cfg.fvg_max_age]
-            continue
 
-        # ── Regime filter: skip if VIX too high ──
-        if cfg.use_vix_filter and not vix_safe[i]:
-            _skip["regime"] += 1
-            if not np.isnan(bull_fvg_top.iloc[i]):
-                active_bull_fvgs.append((i, float(bull_fvg_top.iloc[i]), float(bull_fvg_bot.iloc[i])))
-            if not np.isnan(bear_fvg_top.iloc[i]):
-                active_bear_fvgs.append((i, float(bear_fvg_top.iloc[i]), float(bear_fvg_bot.iloc[i])))
-            active_bull_fvgs = [(b, t, bt) for b, t, bt in active_bull_fvgs if i - b <= cfg.fvg_max_age]
-            active_bear_fvgs = [(b, t, bt) for b, t, bt in active_bear_fvgs if i - b <= cfg.fvg_max_age]
-            continue
-
-        _skip["passed"] += 1
-
-        # Track FVGs (use .iloc to avoid FutureWarning)
+        # ── ARM new limit orders when an FVG forms ──
         if not np.isnan(bull_fvg_top.iloc[i]):
-            active_bull_fvgs.append((i, float(bull_fvg_top.iloc[i]), float(bull_fvg_bot.iloc[i])))
+            fvg_top = float(bull_fvg_top.iloc[i])
+            fvg_bot = float(bull_fvg_bot.iloc[i])
+            if trend[i] == 1:
+                htf_ok = not cfg.use_htf_filter or htf[i] >= 0
+                weekly_ok = not cfg.use_weekly_trend_filter or weekly_trend[i] >= 0
+                adx_ok = adx[i] >= cfg.adx_threshold
+                vix_ok = not cfg.use_vix_filter or vix_safe[i]
+                if htf_ok and weekly_ok and adx_ok and vix_ok:
+                    drawn_liq = None
+                    for j in range(i - 1, max(i - 50, 0), -1):
+                        sh = swing_highs.iloc[j]
+                        if not np.isnan(sh) and sh > fvg_top:
+                            drawn_liq = sh
+                            break
+                    if drawn_liq is None:
+                        recent_high = np.max(high[max(0, i - 20):i])
+                        if recent_high > fvg_top * 1.001:
+                            drawn_liq = recent_high
+                    if drawn_liq is not None:
+                        armed_bull[i] = (fvg_top, fvg_bot, i, drawn_liq,
+                                         atr[i], adx[i], rvol[i])
+
         if not np.isnan(bear_fvg_top.iloc[i]):
-            active_bear_fvgs.append((i, float(bear_fvg_top.iloc[i]), float(bear_fvg_bot.iloc[i])))
+            fvg_top = float(bear_fvg_top.iloc[i])
+            fvg_bot = float(bear_fvg_bot.iloc[i])
+            if trend[i] == -1:
+                htf_ok = not cfg.use_htf_filter or htf[i] <= 0
+                weekly_ok = not cfg.use_weekly_trend_filter or weekly_trend[i] <= 0
+                adx_ok = adx[i] >= cfg.adx_threshold
+                vix_ok = not cfg.use_vix_filter or vix_safe[i]
+                if htf_ok and weekly_ok and adx_ok and vix_ok:
+                    drawn_liq = None
+                    for j in range(i - 1, max(i - 50, 0), -1):
+                        sl_val = swing_lows.iloc[j]
+                        if not np.isnan(sl_val) and sl_val < fvg_bot:
+                            drawn_liq = sl_val
+                            break
+                    if drawn_liq is None:
+                        recent_low = np.min(low[max(0, i - 20):i])
+                        if recent_low < fvg_bot * 0.999:
+                            drawn_liq = recent_low
+                    if drawn_liq is not None:
+                        armed_bear[i] = (fvg_bot, fvg_top, i, drawn_liq,
+                                         atr[i], adx[i], rvol[i])
 
-        # Prune old FVGs
-        active_bull_fvgs = [(b, t, bt) for b, t, bt in active_bull_fvgs if i - b <= cfg.fvg_max_age]
-        active_bear_fvgs = [(b, t, bt) for b, t, bt in active_bear_fvgs if i - b <= cfg.fvg_max_age]
+        # ── Check if any armed limit order was filled this bar ──
 
-        # ── BULLISH CONTINUATION ──
-        if trend[i] == 1:
-            # HTF filter: only long if 1H EMA bullish (or filter disabled)
-            if cfg.use_htf_filter and htf[i] < 0:
+        to_remove_bull = []
+        for fvg_bar, (limit_price, fvg_bot, armed_bar, drawn_liq,
+                      atr_arm, adx_arm, rvol_arm) in armed_bull.items():
+            bars_elapsed = i - armed_bar
+            if bars_elapsed > cfg.retest_max_bars:
+                to_remove_bull.append(fvg_bar)
+                _skip["no_retest"] += 1
                 continue
-            # Weekly trend filter: only long if weekly trend is bullish or flat
-            if cfg.use_weekly_trend_filter and weekly_trend[i] == -1:
+            # Invalidated: price breaks below FVG bottom (structure destroyed)
+            if low[i] < fvg_bot:
+                to_remove_bull.append(fvg_bar)
+                _skip["invalidated"] += 1
                 continue
-
-            # Find drawn liquidity (nearest swing high above)
-            drawn_liq = None
-            for j in range(i - 1, max(i - 50, 0), -1):
-                sh = swing_highs.iloc[j]
-                if not np.isnan(sh) and sh > close[i]:
-                    drawn_liq = sh
-                    break
-            if drawn_liq is None:
-                recent_high = np.max(high[max(0, i-20):i])
-                if recent_high > close[i] * 1.001:
-                    drawn_liq = recent_high
-                else:
-                    continue
-
-            # Check FVG reaction
-            for fvg_bar, fvg_top, fvg_bot in active_bull_fvgs:
-                if fvg_bar >= i - 3:
-                    continue
-                if low[i] <= fvg_top and low[i] >= fvg_bot and close[i] > fvg_top:
-                    # RVOL check on signal candle
-                    if rvol[i] < cfg.rvol_multiplier:
-                        continue
-
-                    entry = close[i]
-                    sl = entry - atr[i] * cfg.atr_multiplier_sl
-                    risk = entry - sl
-                    tp = entry + risk * cfg.rr_ratio
-                    if drawn_liq < tp:
-                        tp = drawn_liq
-                    reward = tp - entry
-                    if risk <= 0 or reward <= 0 or reward / risk < 1.0:
-                        continue
-
-                    signals.append({
-                        "bar": i, "direction": "buy", "entry": entry,
-                        "sl": sl, "tp": tp, "strategy": "continuation",
-                        "reason": f"Bull cont DL={drawn_liq:.2f} RR={reward/risk:.1f} ADX={adx[i]:.0f}",
-                    })
-                    active_bull_fvgs = [(b, t, bt) for b, t, bt in active_bull_fvgs if b != fvg_bar]
-                    break
-
-        # ── BEARISH CONTINUATION ──
-        elif trend[i] == -1:
-            if cfg.use_htf_filter and htf[i] > 0:
+            if bars_elapsed == 0:
                 continue
-            # Weekly trend filter: only short if weekly trend is bearish or flat
-            if cfg.use_weekly_trend_filter and weekly_trend[i] == 1:
+            # Retest: candle low touched limit price
+            if not (low[i] <= limit_price <= high[i]):
                 continue
+            if not in_session[i]:
+                continue
+            if rvol[i] < cfg.rvol_multiplier:
+                continue
+            # Build trade
+            entry = limit_price
+            sl = entry - atr_arm * cfg.atr_multiplier_sl
+            risk = entry - sl
+            if risk <= 0:
+                continue
+            tp = entry + risk * cfg.rr_ratio
+            if drawn_liq < tp:
+                tp = drawn_liq
+            reward = tp - entry
+            if reward / risk < 1.0:
+                continue
+            if i not in used_bars:
+                used_bars.add(i)
+                _skip["passed"] += 1
+                signals.append({
+                    "bar": i, "direction": "buy",
+                    "entry": round(entry, 4),
+                    "sl": round(sl, 4),
+                    "tp": round(tp, 4),
+                    "strategy": "continuation_retest",
+                    "reason": (f"Bull retest FVG={limit_price:.2f} "
+                               f"SL=1.0xATR({atr_arm:.2f}) DL={drawn_liq:.2f} "
+                               f"RR={reward/risk:.1f} ADX={adx_arm:.0f} RVOL={rvol[i]:.2f}"),
+                })
+            to_remove_bull.append(fvg_bar)
 
-            drawn_liq = None
-            for j in range(i - 1, max(i - 50, 0), -1):
-                sl_val = swing_lows.iloc[j]
-                if not np.isnan(sl_val) and sl_val < close[i]:
-                    drawn_liq = sl_val
-                    break
-            if drawn_liq is None:
-                recent_low = np.min(low[max(0, i-20):i])
-                if recent_low < close[i] * 0.999:
-                    drawn_liq = recent_low
-                else:
-                    continue
+        for k in to_remove_bull:
+            armed_bull.pop(k, None)
 
-            for fvg_bar, fvg_top, fvg_bot in active_bear_fvgs:
-                if fvg_bar >= i - 3:
-                    continue
-                if high[i] >= fvg_bot and high[i] <= fvg_top and close[i] < fvg_bot:
-                    if rvol[i] < cfg.rvol_multiplier:
-                        continue
+        to_remove_bear = []
+        for fvg_bar, (limit_price, fvg_top, armed_bar, drawn_liq,
+                      atr_arm, adx_arm, rvol_arm) in armed_bear.items():
+            bars_elapsed = i - armed_bar
+            if bars_elapsed > cfg.retest_max_bars:
+                to_remove_bear.append(fvg_bar)
+                _skip["no_retest"] += 1
+                continue
+            if high[i] > fvg_top:
+                to_remove_bear.append(fvg_bar)
+                _skip["invalidated"] += 1
+                continue
+            if bars_elapsed == 0:
+                continue
+            if not (low[i] <= limit_price <= high[i]):
+                continue
+            if not in_session[i]:
+                continue
+            if rvol[i] < cfg.rvol_multiplier:
+                continue
+            entry = limit_price
+            sl = entry + atr_arm * cfg.atr_multiplier_sl
+            risk = sl - entry
+            if risk <= 0:
+                continue
+            tp = entry - risk * cfg.rr_ratio
+            if drawn_liq > tp:
+                tp = drawn_liq
+            reward = entry - tp
+            if reward / risk < 1.0:
+                continue
+            if i not in used_bars:
+                used_bars.add(i)
+                _skip["passed"] += 1
+                signals.append({
+                    "bar": i, "direction": "sell",
+                    "entry": round(entry, 4),
+                    "sl": round(sl, 4),
+                    "tp": round(tp, 4),
+                    "strategy": "continuation_retest",
+                    "reason": (f"Bear retest FVG={limit_price:.2f} "
+                               f"SL=1.0xATR({atr_arm:.2f}) DL={drawn_liq:.2f} "
+                               f"RR={reward/risk:.1f} ADX={adx_arm:.0f} RVOL={rvol[i]:.2f}"),
+                })
+            to_remove_bear.append(fvg_bar)
 
-                    entry = close[i]
-                    sl = entry + atr[i] * cfg.atr_multiplier_sl
-                    risk = sl - entry
-                    tp = entry - risk * cfg.rr_ratio
-                    if drawn_liq > tp:
-                        tp = drawn_liq
-                    reward = entry - tp
-                    if risk <= 0 or reward <= 0 or reward / risk < 1.0:
-                        continue
+        for k in to_remove_bear:
+            armed_bear.pop(k, None)
 
-                    signals.append({
-                        "bar": i, "direction": "sell", "entry": entry,
-                        "sl": sl, "tp": tp, "strategy": "continuation",
-                        "reason": f"Bear cont DL={drawn_liq:.2f} RR={reward/risk:.1f} ADX={adx[i]:.0f}",
-                    })
-                    active_bear_fvgs = [(b, t, bt) for b, t, bt in active_bear_fvgs if b != fvg_bar]
-                    break
-
-    # Print diagnostics
+    # Diagnostics
     total_bars = len(df) - 30
     print(f"    Filter diagnostics ({total_bars} bars scanned):")
-    print(f"      Skipped — ATR: {_skip['atr']} | Session: {_skip['session']} | ADX<{cfg.adx_threshold}: {_skip['adx']} | Regime(VIX/Weekly): {_skip['regime']}")
+    print(f"      Skipped — ATR: {_skip['atr']} | Session: {_skip['session']} | "
+          f"ADX<{cfg.adx_threshold}: {_skip['adx']} | Regime: {_skip['regime']}")
+    print(f"      No retest (expired): {_skip['no_retest']} | "
+          f"Invalidated (structure break): {_skip['invalidated']}")
     print(f"      Signals generated: {len(signals)}")
-
     return signals
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
