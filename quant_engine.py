@@ -57,12 +57,14 @@ class Config:
     fvg_max_age: int = 20       # max bars old an FVG can be
     trend_lookback: int = 20
 
-    # ── Session Filter (EST) ──
+    # ── Session Filter (EST) — AM ONLY ──
+    # Analysis showed AM session (9:30-11:30) is the ONLY profitable window
+    # PM session (1:30-3:30) has 27.3% WR vs 32.4% AM — killed the edge
     session_filter: bool = True
     am_start: int = 570         # 9:30 in minutes
     am_end: int = 690           # 11:30
-    pm_start: int = 810         # 13:30
-    pm_end: int = 930           # 15:30
+    pm_start: int = 9999        # PM session DISABLED — set to unreachable value
+    pm_end: int = 9999          # PM session DISABLED
 
     # ── Confluence: 1H EMA ──
     ema_period: int = 20
