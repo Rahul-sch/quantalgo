@@ -70,6 +70,11 @@ LIVE_CONFIG = Config(
     vix_threshold=25.0,
     use_weekly_trend_filter=True,
     weekly_ema_period=10,
+    # Top-Down Macro Veto
+    use_macro_veto=True,
+    macro_sma_period=20,
+    macro_veto_longs_below_sma=True,
+    macro_veto_shorts_above_sma=True,
     etf_slippage_pct=0.00005,
     commission_round_trip=2.40,
     initial_capital=10000.0,

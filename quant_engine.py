@@ -103,6 +103,14 @@ class Config:
     use_weekly_trend_filter: bool = True
     weekly_ema_period: int = 10     # weekly EMA period for trend confirmation
 
+    # ── Top-Down Macro Veto ──
+    # If price < 20-Month SMA: ALL long signals disabled (macro downtrend)
+    # If price > 20-Month SMA: ALL short signals disabled (macro uptrend)
+    use_macro_veto: bool = True
+    macro_sma_period: int = 20      # 20-Month SMA
+    macro_veto_longs_below_sma: bool = True   # block longs in macro downtrend
+    macro_veto_shorts_above_sma: bool = True  # block shorts in macro uptrend
+
 
 CFG = Config()
 
@@ -235,6 +243,88 @@ def compute_weekly_trend(df_15m: pd.DataFrame, ema_period: int = 10) -> pd.Serie
 
     except Exception as e:
         print(f"    [regime] Weekly trend error: {e} — skipping")
+        return pd.Series(0, index=df_15m.index)
+
+
+def compute_macro_veto(df_15m: pd.DataFrame, cfg: Config) -> pd.Series:
+    """
+    Top-Down Macro Veto using 20-Month SMA.
+
+    Logic (zero lookahead bias):
+    - Download monthly OHLCV for QQQ going back cfg.macro_sma_period + 6 months
+    - Compute 20-Month SMA on monthly close
+    - Shift by 1 month (.shift(1)) — we only know LAST month's SMA
+    - Map to 15m bars via forward-fill
+    - Returns Series: 1=long_ok/short_blocked, -1=short_ok/long_blocked, 0=neutral
+
+    When price < 20-Month SMA:
+      → Macro downtrend → veto ALL longs (only shorts allowed)
+    When price > 20-Month SMA:
+      → Macro uptrend → veto ALL shorts (only longs allowed)
+    """
+    try:
+        import yfinance as yf
+
+        if not isinstance(df_15m.index, pd.DatetimeIndex):
+            idx = pd.to_datetime(df_15m.index, utc=True)
+        else:
+            idx = df_15m.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        idx_est = idx.tz_convert("US/Eastern")
+
+        # Fetch enough monthly data (SMA period + buffer)
+        start = (idx_est[0] - pd.DateOffset(months=cfg.macro_sma_period + 6)).date()
+        end = (idx_est[-1] + pd.DateOffset(months=1)).date()
+
+        monthly = yf.download(
+            "QQQ",
+            start=str(start),
+            end=str(end),
+            interval="1mo",
+            progress=False,
+            auto_adjust=True,
+        )
+
+        if monthly.empty or len(monthly) < cfg.macro_sma_period:
+            print(f"    [macro] Insufficient monthly data ({len(monthly)} bars) — skipping veto")
+            return pd.Series(0, index=df_15m.index)
+
+        close = monthly["Close"].squeeze()
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+
+        # 20-Month SMA, shifted by 1 to prevent lookahead
+        sma_20m = close.rolling(cfg.macro_sma_period).mean().shift(1)
+
+        # Macro regime: +1 = above SMA (bullish), -1 = below SMA (bearish)
+        macro_regime = pd.Series(0, index=sma_20m.index, dtype=int)
+        macro_regime[close > sma_20m] = 1
+        macro_regime[close <= sma_20m] = -1
+
+        # Localize monthly index
+        if monthly.index.tz is None:
+            monthly_idx = pd.to_datetime(monthly.index).tz_localize("US/Eastern")
+        else:
+            monthly_idx = pd.to_datetime(monthly.index).tz_convert("US/Eastern")
+
+        macro_series = pd.Series(macro_regime.values, index=monthly_idx)
+
+        # Forward-fill to 15m bars
+        macro_15m = macro_series.reindex(df_15m.index, method="ffill").fillna(0).astype(int)
+
+        # Report
+        n_bull = (macro_15m == 1).sum()
+        n_bear = (macro_15m == -1).sum()
+        pct_bull = n_bull / len(macro_15m) * 100 if len(macro_15m) > 0 else 0
+        print(f"    [macro] 20-Month SMA veto: "
+              f"{n_bull} bars BULLISH ({pct_bull:.0f}%) | "
+              f"{n_bear} bars BEARISH ({100-pct_bull:.0f}%)")
+
+        return macro_15m
+
+    except Exception as e:
+        print(f"    [macro] Veto error: {e} — skipping")
         return pd.Series(0, index=df_15m.index)
 
 
@@ -410,6 +500,12 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     else:
         df_ind["weekly_trend"] = 0  # 0 = no filter, allow both directions
 
+    # Top-Down Macro Veto: 20-Month SMA
+    if cfg.use_macro_veto:
+        df_ind["macro_regime"] = compute_macro_veto(df, cfg)
+    else:
+        df_ind["macro_regime"] = 0  # 0 = no veto, allow both directions
+
     return df_ind
 
 
@@ -493,9 +589,10 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
     htf = ind["htf_signal"].values
     vix_safe = ind["vix_safe"].values.astype(bool)
     weekly_trend = ind["weekly_trend"].values
+    macro_regime = ind["macro_regime"].values  # +1=bullish, -1=bearish, 0=neutral
 
     _skip = {"atr": 0, "session": 0, "adx": 0, "regime": 0,
-             "no_retest": 0, "invalidated": 0, "passed": 0}
+             "macro_veto": 0, "no_retest": 0, "invalidated": 0, "passed": 0}
 
     # armed_bull / armed_bear: fvg_bar -> (limit_price, fvg_other_edge, armed_bar,
     #                                       drawn_liq, atr_at_arm, adx_at_arm, rvol_at_arm)
@@ -517,7 +614,11 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
                 weekly_ok = not cfg.use_weekly_trend_filter or weekly_trend[i] >= 0
                 adx_ok = adx[i] >= cfg.adx_threshold
                 vix_ok = not cfg.use_vix_filter or vix_safe[i]
-                if htf_ok and weekly_ok and adx_ok and vix_ok:
+                # MACRO VETO: no longs if price below 20-Month SMA
+                macro_ok = (not cfg.use_macro_veto or
+                            not cfg.macro_veto_longs_below_sma or
+                            macro_regime[i] >= 0)
+                if macro_ok and htf_ok and weekly_ok and adx_ok and vix_ok:
                     drawn_liq = None
                     for j in range(i - 1, max(i - 50, 0), -1):
                         sh = swing_highs.iloc[j]
@@ -540,7 +641,11 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
                 weekly_ok = not cfg.use_weekly_trend_filter or weekly_trend[i] <= 0
                 adx_ok = adx[i] >= cfg.adx_threshold
                 vix_ok = not cfg.use_vix_filter or vix_safe[i]
-                if htf_ok and weekly_ok and adx_ok and vix_ok:
+                # MACRO VETO: no shorts if price above 20-Month SMA
+                macro_ok = (not cfg.use_macro_veto or
+                            not cfg.macro_veto_shorts_above_sma or
+                            macro_regime[i] <= 0)
+                if macro_ok and htf_ok and weekly_ok and adx_ok and vix_ok:
                     drawn_liq = None
                     for j in range(i - 1, max(i - 50, 0), -1):
                         sl_val = swing_lows.iloc[j]
@@ -660,9 +765,12 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
 
     # Diagnostics
     total_bars = len(df) - 30
+    macro_bull = int((macro_regime == 1).sum())
+    macro_bear = int((macro_regime == -1).sum())
     print(f"    Filter diagnostics ({total_bars} bars scanned):")
     print(f"      Skipped — ATR: {_skip['atr']} | Session: {_skip['session']} | "
-          f"ADX<{cfg.adx_threshold}: {_skip['adx']} | Regime: {_skip['regime']}")
+          f"ADX<{cfg.adx_threshold}: {_skip['adx']} | Regime(VIX): {_skip['regime']}")
+    print(f"      Macro regime — Bullish: {macro_bull} bars | Bearish: {macro_bear} bars")
     print(f"      No retest (expired): {_skip['no_retest']} | "
           f"Invalidated (structure break): {_skip['invalidated']}")
     print(f"      Signals generated: {len(signals)}")
