@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from typing import Optional
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,7 +214,7 @@ def load_blackout_windows() -> list:
         return []
 
 
-def get_next_blackout(windows: list) -> dict | None:
+def get_next_blackout(windows: list) -> Optional[dict]:
     """Find the next upcoming blackout window from now (US/Eastern)."""
     try:
         import pytz
