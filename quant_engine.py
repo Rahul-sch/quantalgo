@@ -167,12 +167,8 @@ def apply_friction(
 def _fetch_vix_yfinance(start_date: str, end_date: str) -> Optional[pd.Series]:
     """
     Fetch VIX daily closes from yfinance (^VIX index).
-    Used ONLY for VIX regime data — NOT for the 15m price data (which uses Massive).
-    Returns a Series indexed by US/Eastern datetime, or None on failure.
-    FAIL-SAFE: returns None on ANY error.
-    Note: Polygon/Massive free tier does not serve index tickers like I:VIX (403).
-    yfinance is acceptable here since VIX data is: (a) daily, (b) widely available,
-    (c) not subject to Polygon tier restrictions.
+    Returns a Series indexed by UTC DatetimeIndex, or None on failure.
+    Uses UTC throughout to avoid tz-aware datetime conversion errors.
     """
     try:
         import yfinance as yf
@@ -189,10 +185,12 @@ def _fetch_vix_yfinance(start_date: str, end_date: str) -> Optional[pd.Series]:
         close = vix["Close"].squeeze()
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
+        # Normalize index to UTC DatetimeIndex (avoids tz-aware conversion errors)
+        close.index = pd.DatetimeIndex(close.index)
         if close.index.tz is None:
-            close.index = pd.to_datetime(close.index).tz_localize("US/Eastern")
+            close.index = close.index.tz_localize("UTC")
         else:
-            close.index = close.index.tz_convert("US/Eastern")
+            close.index = close.index.tz_convert("UTC")
         return close
     except Exception as e:
         print(f"    [regime] yfinance VIX fetch error: {e}")
@@ -211,10 +209,9 @@ def compute_vix_regime(df_15m: pd.DataFrame, vix_threshold: float = 25.0) -> pd.
     fail_safe = pd.Series(False, index=df_15m.index)
 
     try:
-        # Always convert to DatetimeIndex (handles object/string index from CSV)
-        idx = pd.DatetimeIndex(pd.to_datetime(df_15m.index))
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
+        # utc=True is required when index contains tz-aware datetime objects
+        # (Python 3.9 / pandas 1.x raises ValueError without it)
+        idx = pd.DatetimeIndex(pd.to_datetime(df_15m.index, utc=True))
         idx_est = idx.tz_convert("US/Eastern")
 
         start_date = str(idx_est[0].date())
@@ -226,18 +223,15 @@ def compute_vix_regime(df_15m: pd.DataFrame, vix_threshold: float = 25.0) -> pd.
             print(f"    [regime] ⚠️  VIX data UNAVAILABLE — defaulting to BLOCK ALL TRADES (fail-safe)")
             return fail_safe
 
-        # shift(1): we only know yesterday's closing VIX
+        # shift(1): we only know yesterday's closing VIX (no lookahead)
         vix_shifted = vix_close.shift(1)
+        # vix_close is already UTC from _fetch_vix_yfinance
 
-        # Normalize to naive datetime for reindex
-        vix_idx_naive = vix_shifted.index.tz_localize(None) if vix_shifted.index.tz is not None else vix_shifted.index
-        vix_daily = pd.Series(vix_shifted.values, index=pd.to_datetime(vix_idx_naive))
-
-        df_idx_dt = pd.DatetimeIndex(pd.to_datetime(df_15m.index))
-        if df_idx_dt.tz is None:
-            df_idx_dt = df_idx_dt.tz_localize("UTC")
-        df_idx_naive = df_idx_dt.tz_convert("US/Eastern").tz_localize(None)
-        vix_15m = vix_daily.reindex(df_idx_naive, method="ffill")
+        # Convert df index to UTC, normalize to day boundary for ffill reindex
+        df_idx_utc = pd.DatetimeIndex(pd.to_datetime(df_15m.index, utc=True))
+        df_dates_utc = df_idx_utc.normalize()  # floor to midnight UTC, keeps tz
+        vix_15m = vix_shifted.reindex(df_dates_utc, method="ffill")
+        vix_15m.index = df_15m.index  # restore original bar index
 
         safe = vix_15m < vix_threshold
         # FAIL-SAFE: any bar with no VIX data → block (False), not allow
