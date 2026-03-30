@@ -66,14 +66,14 @@ class Config:
     fvg_max_age: int = 20       # max bars old an FVG can be
     trend_lookback: int = 20
 
-    # ── Session Filter (EST) — AM ONLY ──
-    # Analysis showed AM session (9:30-11:30) is the ONLY profitable window
-    # PM session (1:30-3:30) has 27.3% WR vs 32.4% AM — killed the edge
+    # ── Session Filter (EST) — AM + PM ──
+    # AM: 9:30-11:30 ET (historically 32.4% WR)
+    # PM: 1:30-3:30 ET (historically 27.3% WR — enabled for live forward-testing)
     session_filter: bool = True
     am_start: int = 570         # 9:30 in minutes
     am_end: int = 690           # 11:30
-    pm_start: int = 9999        # PM session DISABLED
-    pm_end: int = 9999          # PM session DISABLED
+    pm_start: int = 810         # 13:30 (1:30 PM) in minutes
+    pm_end: int = 930           # 15:30 (3:30 PM) in minutes
 
     # ── Retest Entry Logic ──
     use_retest_entry: bool = True   # Wait for price to pull back into FVG (limit order)
