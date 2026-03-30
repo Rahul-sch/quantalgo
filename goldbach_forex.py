@@ -64,9 +64,10 @@ PAIRS = {
 }
 
 # Risk parameters
-ACCOUNT_SIZE = 10_000.0     # $10k demo account
-RISK_PCT = 0.01             # 1% risk per trade
-MAX_DAILY_TRADES = 4        # max signals per day
+ACCOUNT_SIZE    = 10_000.0  # $10k demo account
+RISK_PCT        = 0.01      # 1% risk per trade
+RISK_PER_TRADE  = ACCOUNT_SIZE * RISK_PCT  # hard cap: $100.00 per trade
+MAX_DAILY_TRADES = 4        # max signals per day per pair
 
 
 @dataclass
@@ -333,8 +334,8 @@ def scan_for_goldbach_signals(levels: GoldbachLevels) -> List[ForexSignal]:
 
         # Only take if RR >= 1.5
         if rr >= 1.5 and sl_pips <= 50:  # max 50 pip SL
-            risk_amount = ACCOUNT_SIZE * RISK_PCT
-            # Lot size: risk / (SL_pips * pip_value)
+            # Hard cap: $100.00 risk regardless of pip math
+            risk_amount = RISK_PER_TRADE
             lot_size = risk_amount / (sl_pips * pair_info["pip_value"]) if sl_pips > 0 else 0
 
             # Nearest PO9 support level
@@ -356,7 +357,7 @@ def scan_for_goldbach_signals(levels: GoldbachLevels) -> List[ForexSignal]:
                         f"({price:.5f}), target equilibrium ({levels.equilibrium:.5f})"),
                 levels=levels,
                 lot_size=round(lot_size, 2),
-                risk_amount=round(risk_amount, 2),
+                risk_amount=round(risk_amount, 2),  # always $100.00
             ))
 
     # ── PREMIUM REJECTION (SELL) ──
@@ -370,7 +371,8 @@ def scan_for_goldbach_signals(levels: GoldbachLevels) -> List[ForexSignal]:
         rr = tp_pips / sl_pips if sl_pips > 0 else 0
 
         if rr >= 1.5 and sl_pips <= 50:
-            risk_amount = ACCOUNT_SIZE * RISK_PCT
+            # Hard cap: $100.00 risk regardless of pip math
+            risk_amount = RISK_PER_TRADE
             lot_size = risk_amount / (sl_pips * pair_info["pip_value"]) if sl_pips > 0 else 0
 
             nearest_po9 = min(levels.po9, key=lambda x: abs(x - price))

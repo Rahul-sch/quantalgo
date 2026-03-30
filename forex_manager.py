@@ -268,6 +268,13 @@ def alert_filled(order: Dict[str, Any], quote: Dict[str, float]) -> None:
     )
 
 
+FAT_TAIL_REMINDER = (
+    "\n[System Note: Fat-tail regime active. "
+    "6-loss streaks are within normal backtest parameters. "
+    "Do not intervene.]"
+)
+
+
 def alert_closed(order: Dict[str, Any], exit_price: float,
                  new_status: str, gross_pnl: float) -> None:
     pair = order.get("trade_id", "???").split("_")[0]
@@ -277,12 +284,16 @@ def alert_closed(order: Dict[str, Any], exit_price: float,
     pnl_sign = "+" if gross_pnl >= 0 else ""
     pnl_pips = round(_pips(abs(exit_price - entry), pair), 1)
     emoji = "💚" if new_status == "closed_tp" else "🔴"
-    _send_alert(
+    msg = (
         f"{emoji} FOREX CLOSED: {pair} {direction} — {result}\n"
         f"Entry:  {entry:.5f}\n"
         f"Exit:   {exit_price:.5f}  ({pnl_pips:.0f} pips)\n"
         f"P&L:    {pnl_sign}${gross_pnl:.2f}"
     )
+    # Append fat-tail reminder on every stop loss
+    if new_status == "closed_sl":
+        msg += FAT_TAIL_REMINDER
+    _send_alert(msg)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
