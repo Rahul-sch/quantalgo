@@ -358,10 +358,8 @@ def compute_macro_veto(df_15m: pd.DataFrame, cfg: Config) -> pd.Series:
     halt trading. Monthly macro regime changes rarely intraday.
     """
     try:
-        # Always convert to DatetimeIndex (handles object/string index from CSV)
-        idx = pd.DatetimeIndex(pd.to_datetime(df_15m.index))
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
+        # utc=True required for tz-aware datetime objects (Python 3.9 / pandas 1.x)
+        idx = pd.DatetimeIndex(pd.to_datetime(df_15m.index, utc=True))
         idx_est = idx.tz_convert("US/Eastern")
 
         start = str((idx_est[0] - pd.DateOffset(months=cfg.macro_sma_period + 6)).date())
@@ -381,15 +379,16 @@ def compute_macro_veto(df_15m: pd.DataFrame, cfg: Config) -> pd.Series:
         macro_regime[close > sma_20m] = 1
         macro_regime[close <= sma_20m] = -1
 
-        # Normalize monthly index to naive for reindex
-        m_idx_naive = close.index.tz_localize(None) if close.index.tz is not None else close.index
-        macro_series = pd.Series(macro_regime.values, index=pd.to_datetime(m_idx_naive))
+        # Normalize monthly index to UTC for safe reindex
+        if close.index.tz is None:
+            m_idx_utc = close.index.tz_localize("UTC")
+        else:
+            m_idx_utc = close.index.tz_convert("UTC")
+        macro_series = pd.Series(macro_regime.values, index=m_idx_utc)
 
-        df_idx_dt = pd.DatetimeIndex(pd.to_datetime(df_15m.index))
-        if df_idx_dt.tz is None:
-            df_idx_dt = df_idx_dt.tz_localize("UTC")
-        df_idx_naive = df_idx_dt.tz_convert("US/Eastern").tz_localize(None)
-        macro_15m = macro_series.reindex(df_idx_naive, method="ffill").fillna(0).astype(int)
+        df_idx_utc = pd.DatetimeIndex(pd.to_datetime(df_15m.index, utc=True))
+        df_dates_utc = df_idx_utc.normalize()  # floor to midnight UTC
+        macro_15m = macro_series.reindex(df_dates_utc, method="ffill").fillna(0).astype(int)
         macro_15m.index = df_15m.index
 
         n_bull = int((macro_15m == 1).sum())
