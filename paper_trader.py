@@ -430,7 +430,10 @@ def resolve_pending_orders(df: pd.DataFrame) -> List[Dict[str, Any]]:
     Called at the START of each cron run, before scanning for new signals.
     """
     ledger = load_state_ledger()
-    pending = [p for p in ledger["pending_orders"] if p["status"] == "pending"]
+    # Only resolve QQQ equity orders — forex orders have signal_ids starting with EURUSD/GBPUSD
+    pending = [p for p in ledger["pending_orders"]
+               if p["status"] == "pending"
+               and p.get("signal_id", "").startswith("QQQ")]
 
     if not pending:
         return []
@@ -562,9 +565,13 @@ def expire_old_pending_orders() -> None:
 def print_ledger_status() -> None:
     """Print a summary of the current state ledger."""
     ledger = load_state_ledger()
-    pending  = [p for p in ledger["pending_orders"] if p["status"] == "pending"]
-    filled   = [p for p in ledger["pending_orders"] if p["status"] == "filled"]
-    expired  = [p for p in ledger["pending_orders"] if p["status"] in ("expired", "cancelled_sl_skip")]
+    # Show QQQ-only orders in the equity ledger status (forex orders filtered out)
+    qqq_orders = [p for p in ledger["pending_orders"]
+                  if p.get("signal_id", "").startswith("QQQ") or
+                     p.get("signal_id", "").startswith("DRY")]
+    pending  = [p for p in qqq_orders if p["status"] == "pending"]
+    filled   = [p for p in qqq_orders if p["status"] == "filled"]
+    expired  = [p for p in qqq_orders if p["status"] in ("expired", "cancelled_sl_skip")]
     alerted  = ledger.get("alerted_signal_ids", [])
 
     print(f"\n  📋 STATE LEDGER ({ledger.get('date', '?')})")
