@@ -169,6 +169,36 @@ def _gross_pnl(entry: float, exit_price: float, direction: str,
     return round(pips * lot_size * pip_val, 2)
 
 
+def validate_order_levels(order: Dict[str, Any]) -> Optional[str]:
+    """
+    Sanity-check SL/TP direction vs entry for the given trade side.
+    Returns an error string if levels are inverted, None if valid.
+
+    BUY:  sl < entry < tp
+    SELL: tp < entry < sl
+    """
+    direction = order["direction"]
+    entry = float(order["entry_price"])
+    sl    = float(order["stop_loss"])
+    tp    = float(order["take_profit"])
+
+    if direction == "buy":
+        if sl >= entry:
+            return (f"BUY has SL ({sl:.5f}) >= entry ({entry:.5f}) — "
+                    f"stale/inverted level, skipping to avoid ghost trigger")
+        if tp <= entry:
+            return (f"BUY has TP ({tp:.5f}) <= entry ({entry:.5f}) — "
+                    f"inverted level, skipping")
+    elif direction == "sell":
+        if sl <= entry:
+            return (f"SELL has SL ({sl:.5f}) <= entry ({entry:.5f}) — "
+                    f"stale/inverted level, skipping to avoid ghost trigger")
+        if tp >= entry:
+            return (f"SELL has TP ({tp:.5f}) >= entry ({entry:.5f}) — "
+                    f"inverted level, skipping")
+    return None
+
+
 def check_order_fills(
     order: Dict[str, Any],
     quote: Dict[str, float],
@@ -358,6 +388,18 @@ def run_manager(dry_run: bool = False) -> None:
 
         if not quote:
             print(f"\n  ⚠️  {pair}: No price data — leaving order as {old_status}")
+            continue
+
+        # ── Direction sanity check — reject ghost/stale levels ──
+        level_err = validate_order_levels(order)
+        if level_err:
+            print(f"\n  ⚠️  {pair} LEVEL SANITY FAIL: {level_err}")
+            print(f"     Skipping this order — mark as 'invalid_levels' in ledger")
+            if not dry_run:
+                order["status"] = "invalid_levels"
+                order["invalid_reason"] = level_err
+                order["invalid_timestamp"] = now.isoformat()
+                changed = True
             continue
 
         new_status, exit_price = check_order_fills(order, quote, dry_run=dry_run)
