@@ -319,12 +319,22 @@ def scan_for_goldbach_signals(levels: GoldbachLevels) -> List[ForexSignal]:
 
     price = levels.current_price
 
+    MIN_SL_PIPS = 5    # minimum pips clearance between entry and SL
+    FALLBACK_SL_PIPS = 15  # fallback SL distance when static SL is inverted/too close
+
     # ── DISCOUNT BOUNCE (BUY) ──
     if levels.zone in ("deep_discount", "discount"):
         # Entry: current price (already in discount)
         entry = price
         # SL: below prev low by 1 PO9 increment (buffer)
         stop_loss = levels.prev_low - po9_increment
+
+        # Dynamic SL check: if static SL is NOT at least MIN_SL_PIPS below entry,
+        # override to entry - FALLBACK_SL_PIPS (handles inverted/too-close levels
+        # on parabolic days where price has blown below the prev dealing range).
+        if (entry - stop_loss) / pip_size < MIN_SL_PIPS:
+            stop_loss = entry - FALLBACK_SL_PIPS * pip_size
+
         # TP: equilibrium (50% of range) — conservative target
         take_profit = levels.equilibrium
 
@@ -365,6 +375,12 @@ def scan_for_goldbach_signals(levels: GoldbachLevels) -> List[ForexSignal]:
         entry = price
         stop_loss = levels.prev_high + po9_increment
         take_profit = levels.equilibrium
+
+        # Dynamic SL check: if static SL is NOT at least MIN_SL_PIPS above entry,
+        # override to entry + FALLBACK_SL_PIPS (handles inverted/too-close levels
+        # on parabolic days where price has blown far above the prev dealing range).
+        if (stop_loss - entry) / pip_size < MIN_SL_PIPS:
+            stop_loss = entry + FALLBACK_SL_PIPS * pip_size
 
         sl_pips = abs(stop_loss - entry) / pip_size
         tp_pips = abs(entry - take_profit) / pip_size
