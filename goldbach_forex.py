@@ -47,11 +47,12 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # Pair definitions
 PAIRS = {
+    # ── Majors ──
     "EURUSD": {
         "ticker": "EURUSD=X",
-        "pip_size": 0.0001,     # 1 pip = 0.0001 for EUR/USD
+        "pip_size": 0.0001,
         "pip_value": 10.0,      # $10 per pip per standard lot (100k units)
-        "spread_pips": 1.2,     # typical retail spread
+        "spread_pips": 1.2,
         "name": "EUR/USD",
     },
     "GBPUSD": {
@@ -60,6 +61,63 @@ PAIRS = {
         "pip_value": 10.0,
         "spread_pips": 1.5,
         "name": "GBP/USD",
+    },
+    "USDJPY": {
+        "ticker": "JPY=X",
+        "pip_size": 0.01,       # JPY pairs: 1 pip = 0.01
+        "pip_value": 6.67,      # ~$6.67 per pip at USD/JPY ~150 (100k/rate)
+        "spread_pips": 1.0,
+        "name": "USD/JPY",
+    },
+    "AUDUSD": {
+        "ticker": "AUDUSD=X",
+        "pip_size": 0.0001,
+        "pip_value": 10.0,
+        "spread_pips": 1.4,
+        "name": "AUD/USD",
+    },
+    "USDCHF": {
+        "ticker": "CHF=X",
+        "pip_size": 0.0001,
+        "pip_value": 11.0,      # ~$11 per pip (inverse of CHF rate)
+        "spread_pips": 1.5,
+        "name": "USD/CHF",
+    },
+    "USDCAD": {
+        "ticker": "CAD=X",
+        "pip_size": 0.0001,
+        "pip_value": 7.30,      # ~$7.30 per pip at USD/CAD ~1.37
+        "spread_pips": 1.8,
+        "name": "USD/CAD",
+    },
+    "NZDUSD": {
+        "ticker": "NZDUSD=X",
+        "pip_size": 0.0001,
+        "pip_value": 10.0,
+        "spread_pips": 1.8,
+        "name": "NZD/USD",
+    },
+    # ── Volatile Crosses (bigger ranges, more data) ──
+    "EURJPY": {
+        "ticker": "EURJPY=X",
+        "pip_size": 0.01,
+        "pip_value": 6.67,
+        "spread_pips": 1.5,
+        "name": "EUR/JPY",
+    },
+    "GBPJPY": {
+        "ticker": "GBPJPY=X",
+        "pip_size": 0.01,
+        "pip_value": 6.67,
+        "spread_pips": 2.5,
+        "name": "GBP/JPY",
+    },
+    "EURGBP": {
+        "ticker": "EURGBP=X",
+        "pip_size": 0.0001,
+        "pip_value": 12.50,     # ~$12.50 per pip (GBP-denominated)
+        "spread_pips": 1.2,
+        "name": "EUR/GBP",
     },
 }
 

@@ -42,16 +42,26 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 FOREX_TICKERS = {
     "EURUSD": "EURUSD=X",
     "GBPUSD": "GBPUSD=X",
-    "USDJPY": "USDJPY=X",
-    "GBPJPY": "GBPJPY=X",
+    "USDJPY": "JPY=X",
     "AUDUSD": "AUDUSD=X",
+    "USDCHF": "CHF=X",
+    "USDCAD": "CAD=X",
+    "NZDUSD": "NZDUSD=X",
+    "EURJPY": "EURJPY=X",
+    "GBPJPY": "GBPJPY=X",
+    "EURGBP": "EURGBP=X",
 }
 
 PIP_SIZES = {
     "EURUSD": 0.0001,
     "GBPUSD": 0.0001,
     "AUDUSD": 0.0001,
+    "USDCHF": 0.0001,
+    "USDCAD": 0.0001,
+    "NZDUSD": 0.0001,
+    "EURGBP": 0.0001,
     "USDJPY": 0.01,
+    "EURJPY": 0.01,
     "GBPJPY": 0.01,
 }
 
@@ -59,8 +69,13 @@ PIP_VALUES = {
     "EURUSD": 10.0,   # $10 per pip per standard lot
     "GBPUSD": 10.0,
     "AUDUSD": 10.0,
-    "USDJPY": 10.0,
-    "GBPJPY": 10.0,
+    "NZDUSD": 10.0,
+    "USDCHF": 11.0,
+    "USDCAD": 7.30,
+    "EURGBP": 12.50,
+    "USDJPY": 6.67,
+    "EURJPY": 6.67,
+    "GBPJPY": 6.67,
 }
 
 COMMISSION_PER_LOT = 0.0   # spread-only model for forex (no fixed commission)
