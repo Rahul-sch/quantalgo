@@ -935,6 +935,44 @@ def find_swings_vectorized(df: pd.DataFrame, lookback: int = 10) -> Tuple[pd.Ser
     return swing_highs, swing_lows
 
 
+def find_irl_target(direction: str, bar_idx: int, entry_price: float,
+                    tp_price: float, high_arr, low_arr, pivot_bars: int = 3) -> float:
+    """
+    Find the nearest Internal Range Liquidity (IRL) between entry and TP.
+    Uses fast n-bar pivots (no lookahead — only pivots confirmed before bar_idx).
+
+    For LONGS: nearest pivot high ABOVE entry but BELOW TP.
+    For SHORTS: nearest pivot low BELOW entry but ABOVE TP.
+
+    Returns the IRL price, or NaN if none found.
+    """
+    if direction == "buy":
+        candidates = []
+        # Scan backward from entry bar for recent pivot highs
+        for j in range(bar_idx - 1, max(pivot_bars, bar_idx - 60), -1):
+            if j < pivot_bars or j >= len(high_arr) - pivot_bars:
+                continue
+            is_pivot = True
+            for k in range(1, pivot_bars + 1):
+                if high_arr[j] < high_arr[j - k] or high_arr[j] < high_arr[j + k]:
+                    is_pivot = False; break
+            if is_pivot and high_arr[j] > entry_price and high_arr[j] < tp_price:
+                candidates.append(high_arr[j])
+        return min(candidates) if candidates else float('nan')
+    else:  # sell
+        candidates = []
+        for j in range(bar_idx - 1, max(pivot_bars, bar_idx - 60), -1):
+            if j < pivot_bars or j >= len(low_arr) - pivot_bars:
+                continue
+            is_pivot = True
+            for k in range(1, pivot_bars + 1):
+                if low_arr[j] > low_arr[j - k] or low_arr[j] > low_arr[j + k]:
+                    is_pivot = False; break
+            if is_pivot and low_arr[j] < entry_price and low_arr[j] > tp_price:
+                candidates.append(low_arr[j])
+        return max(candidates) if candidates else float('nan')
+
+
 def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
     """
     Generate continuation signals using RETEST ENTRY logic.
@@ -1082,15 +1120,18 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
             if i not in used_bars:
                 used_bars.add(i)
                 _skip["passed"] += 1
+                irl = find_irl_target("buy", i, entry, tp, high, low)
                 signals.append({
                     "bar": i, "direction": "buy",
                     "entry": round(entry, 4),
                     "sl": round(sl, 4),
                     "tp": round(tp, 4),
+                    "irl_target": round(irl, 4) if not np.isnan(irl) else None,
                     "strategy": "continuation_retest",
                     "reason": (f"Bull retest FVG={limit_price:.2f} "
                                f"SL=1.0xATR({atr_arm:.2f}) DL={drawn_liq:.2f} "
-                               f"RR={reward/risk:.1f} ADX={adx_arm:.0f} RVOL={rvol[i]:.2f}"),
+                               f"RR={reward/risk:.1f} ADX={adx_arm:.0f} RVOL={rvol[i]:.2f}"
+                               f"{f' IRL={irl:.2f}' if not np.isnan(irl) else ''}"),
                 })
             to_remove_bull.append(fvg_bar)
 
@@ -1131,15 +1172,18 @@ def generate_signals(df: pd.DataFrame, cfg: Config) -> List[Dict[str, Any]]:
             if i not in used_bars:
                 used_bars.add(i)
                 _skip["passed"] += 1
+                irl = find_irl_target("sell", i, entry, tp, high, low)
                 signals.append({
                     "bar": i, "direction": "sell",
                     "entry": round(entry, 4),
                     "sl": round(sl, 4),
                     "tp": round(tp, 4),
+                    "irl_target": round(irl, 4) if not np.isnan(irl) else None,
                     "strategy": "continuation_retest",
                     "reason": (f"Bear retest FVG={limit_price:.2f} "
                                f"SL=1.0xATR({atr_arm:.2f}) DL={drawn_liq:.2f} "
-                               f"RR={reward/risk:.1f} ADX={adx_arm:.0f} RVOL={rvol[i]:.2f}"),
+                               f"RR={reward/risk:.1f} ADX={adx_arm:.0f} RVOL={rvol[i]:.2f}"
+                               f"{f' IRL={irl:.2f}' if not np.isnan(irl) else ''}"),
                 })
             to_remove_bear.append(fvg_bar)
 

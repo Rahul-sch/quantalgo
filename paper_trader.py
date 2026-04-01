@@ -656,7 +656,7 @@ def scan_for_signals(verbose: bool = True) -> List[Dict[str, Any]]:
 
     # Compute current capital from trade history
     trades = load_trades()
-    closed = [t for t in trades if t.get("status") in ("closed_sl", "closed_tp", "closed_eod", "closed_manual")]
+    closed = [t for t in trades if t.get("status") in ("closed_sl", "closed_tp", "closed_eod", "closed_manual", "closed_scratch")]
     total_realized = sum(t.get("net_pnl", 0) or 0 for t in closed)
     current_capital = INITIAL_CAPITAL + total_realized
 
@@ -736,6 +736,8 @@ def scan_for_signals(verbose: bool = True) -> List[Dict[str, Any]]:
             "gross_potential": round(gross_potential, 2),
             "net_potential": round(net_potential, 2),
             "reason": sig.get("reason", ""),
+            "irl_target": sig.get("irl_target", None),
+            "be_triggered": False,
             # Indicator snapshot
             "atr_at_entry": indicators["atr_at_entry"],
             "adx_at_entry": indicators["adx_at_entry"],
@@ -866,17 +868,43 @@ def update_open_trades(verbose: bool = True) -> List[Dict[str, Any]]:
             closed_now.append(trade)
             continue
 
+        # ── Break-Even at IRL logic ──
+        irl = trade.get("irl_target")
+        be_active = trade.get("be_triggered", False)
+
+        if not be_active and irl is not None:
+            # Check if current bar reached the IRL target → activate BE
+            if direction == "buy" and current_price >= irl:
+                trade["be_triggered"] = True
+                trade["original_sl"] = sl
+                trade["stop_loss"] = entry  # move SL to entry
+                be_active = True
+                if verbose:
+                    print(f"    🔒 BE activated: IRL {irl:.2f} hit, SL moved to entry {entry:.2f}")
+            elif direction == "sell" and current_price <= irl:
+                trade["be_triggered"] = True
+                trade["original_sl"] = sl
+                trade["stop_loss"] = entry
+                be_active = True
+                if verbose:
+                    print(f"    🔒 BE activated: IRL {irl:.2f} hit, SL moved to entry {entry:.2f}")
+
+        # Re-read SL after potential BE update
+        sl = trade["stop_loss"]
+
         # Check SL/TP
         if direction == "buy":
             if current_price <= sl:
-                _close_trade(trade, sl, "closed_sl", verbose)
+                status = "closed_scratch" if be_active else "closed_sl"
+                _close_trade(trade, sl, status, verbose)
                 closed_now.append(trade)
             elif current_price >= tp:
                 _close_trade(trade, tp, "closed_tp", verbose)
                 closed_now.append(trade)
         else:
             if current_price >= sl:
-                _close_trade(trade, sl, "closed_sl", verbose)
+                status = "closed_scratch" if be_active else "closed_sl"
+                _close_trade(trade, sl, status, verbose)
                 closed_now.append(trade)
             elif current_price <= tp:
                 _close_trade(trade, tp, "closed_tp", verbose)
@@ -893,7 +921,7 @@ def update_open_trades(verbose: bool = True) -> List[Dict[str, Any]]:
 def show_pnl_summary() -> None:
     """Print full paper trading P&L summary with friction breakdown."""
     trades = load_trades()
-    closed_statuses = ("closed_sl", "closed_tp", "closed_eod", "closed_manual")
+    closed_statuses = ("closed_sl", "closed_tp", "closed_eod", "closed_manual", "closed_scratch")
     closed = [t for t in trades if t.get("status") in closed_statuses]
     open_t = [t for t in trades if t.get("status") == "open"]
 
