@@ -45,9 +45,13 @@ from quant_engine import (
 )
 from notifier import alert_new_trade, alert_session_summary, alert_daily_limit
 
-# Ensure QQQ is available
-if "QQQ" not in INSTRUMENTS:
-    INSTRUMENTS["QQQ"] = "QQQ"
+# Ensure instruments are available
+for _sym in ("QQQ", "SPY"):
+    if _sym not in INSTRUMENTS:
+        INSTRUMENTS[_sym] = _sym
+
+# Instruments to scan (order matters — QQQ first)
+LIVE_SYMBOLS = ["QQQ", "SPY"]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION — LOCKED LIVE-READY PARAMS
@@ -77,7 +81,7 @@ FORCE_CLOSE_MINUTE = 30
 
 # Live-ready config from walk-forward validation
 LIVE_CONFIG = Config(
-    symbols=["QQQ"],
+    symbols=LIVE_SYMBOLS,
     initial_capital=INITIAL_CAPITAL,
     risk_pct=RISK_PCT,
     # Strategy — locked from backtest
@@ -430,10 +434,11 @@ def resolve_pending_orders(df: pd.DataFrame) -> List[Dict[str, Any]]:
     Called at the START of each cron run, before scanning for new signals.
     """
     ledger = load_state_ledger()
-    # Only resolve QQQ equity orders — forex orders have signal_ids starting with EURUSD/GBPUSD
+    # Only resolve equity orders — forex orders have signal_ids starting with EURUSD/GBPUSD etc.
+    equity_prefixes = tuple(LIVE_SYMBOLS)
     pending = [p for p in ledger["pending_orders"]
                if p["status"] == "pending"
-               and p.get("signal_id", "").startswith("QQQ")]
+               and p.get("signal_id", "").startswith(equity_prefixes)]
 
     if not pending:
         return []
@@ -565,13 +570,13 @@ def expire_old_pending_orders() -> None:
 def print_ledger_status() -> None:
     """Print a summary of the current state ledger."""
     ledger = load_state_ledger()
-    # Show QQQ-only orders in the equity ledger status (forex orders filtered out)
-    qqq_orders = [p for p in ledger["pending_orders"]
-                  if p.get("signal_id", "").startswith("QQQ") or
-                     p.get("signal_id", "").startswith("DRY")]
-    pending  = [p for p in qqq_orders if p["status"] == "pending"]
-    filled   = [p for p in qqq_orders if p["status"] == "filled"]
-    expired  = [p for p in qqq_orders if p["status"] in ("expired", "cancelled_sl_skip")]
+    # Show equity-only orders in the ledger status (forex orders filtered out)
+    equity_prefixes = tuple(LIVE_SYMBOLS) + ("DRY",)
+    equity_orders = [p for p in ledger["pending_orders"]
+                     if p.get("signal_id", "").startswith(equity_prefixes)]
+    pending  = [p for p in equity_orders if p["status"] == "pending"]
+    filled   = [p for p in equity_orders if p["status"] == "filled"]
+    expired  = [p for p in equity_orders if p["status"] in ("expired", "cancelled_sl_skip")]
     alerted  = ledger.get("alerted_signal_ids", [])
 
     print(f"\n  📋 STATE LEDGER ({ledger.get('date', '?')})")
@@ -623,7 +628,8 @@ def get_indicator_snapshot(df: pd.DataFrame, bar_idx: int, cfg: Config) -> Dict[
 
 def scan_for_signals(verbose: bool = True) -> List[Dict[str, Any]]:
     """
-    Scan QQQ 15m for fresh continuation signals using the institutional engine.
+    Scan LIVE_SYMBOLS (QQQ, SPY) 15m for fresh continuation signals
+    using the institutional engine.
     """
     if not check_daily_limit():
         if verbose:
@@ -636,7 +642,7 @@ def scan_for_signals(verbose: bool = True) -> List[Dict[str, Any]]:
         print("  INSTITUTIONAL PAPER TRADING SCANNER")
         print(f"  {datetime.now(EST).strftime('%Y-%m-%d %H:%M:%S %Z')}")
         print("=" * 60)
-        print(f"  Instrument:   QQQ")
+        print(f"  Instruments:  {', '.join(LIVE_SYMBOLS)}")
         print(f"  Timeframe:    15m")
         print(f"  ATR SL:       {LIVE_CONFIG.atr_multiplier_sl}x")
         print(f"  Risk/Reward:  {LIVE_CONFIG.rr_ratio}:1")
@@ -647,136 +653,144 @@ def scan_for_signals(verbose: bool = True) -> List[Dict[str, Any]]:
         print(f"  Daily P&L:    ${state.get('daily_pnl', 0):+.2f} (limit: -${MAX_DAILY_LOSS})")
         print()
 
-    # Download fresh 15m data
-    df = download_data("QQQ", period="60d", interval="15m")
-    if df.empty or len(df) < 50:
-        if verbose:
-            print("  ⚠️  Insufficient data — need at least 50 bars")
-        return []
-
     # Compute current capital from trade history
     trades = load_trades()
     closed = [t for t in trades if t.get("status") in ("closed_sl", "closed_tp", "closed_eod", "closed_manual", "closed_scratch")]
     total_realized = sum(t.get("net_pnl", 0) or 0 for t in closed)
     current_capital = INITIAL_CAPITAL + total_realized
 
-    # Generate signals using institutional engine
-    signals = generate_signals(df, LIVE_CONFIG)
+    all_new_trades = []
 
-    # Filter to only recent signals (last 3 bars)
-    recent_signals = [s for s in signals if s.get("bar", 0) >= len(df) - 3]
-
-    new_trades = []
-    for sig in recent_signals:
-        entry = sig["entry"]
-        sl = sig["sl"]
-        tp = sig["tp"]
-        direction = sig["direction"]
-        bar_idx = sig["bar"]
-
-        sl_dist = abs(entry - sl)
-        if sl_dist <= 0:
-            continue
-
-        risk_amount = current_capital * RISK_PCT
-        position_size = risk_amount / sl_dist
-        rr = abs(tp - entry) / sl_dist
-
-        # Get indicator snapshot for CSV
-        indicators = get_indicator_snapshot(df, bar_idx, LIVE_CONFIG)
-
-        # Apply friction to estimate net P&L at TP
-        adj_entry, adj_exit_tp, commission = apply_friction(
-            entry, tp, direction, "QQQ", LIVE_CONFIG
-        )
-        if direction == "buy":
-            gross_potential = (tp - entry) * position_size
-            net_potential = (adj_exit_tp - adj_entry) * position_size - commission
-        else:
-            gross_potential = (entry - tp) * position_size
-            net_potential = (adj_entry - adj_exit_tp) * position_size - commission
-
-        current_price = float(df["Close"].iloc[-1])
-
-        # Build signal fingerprint for deduplication
-        bar_time = df.index[bar_idx]
-        signal_id = _signal_fingerprint("QQQ", bar_time, entry, direction)
-
-        # Skip if we've already armed this exact signal in a prior cron run
-        if is_already_alerted(signal_id):
-            if verbose:
-                print(f"  [ledger] Skipping duplicate signal: {signal_id[:50]}")
-            continue
-
-        # Also skip if there's already a pending order for this signal
-        ledger_check = load_state_ledger()
-        existing_pending = [p for p in ledger_check["pending_orders"]
-                            if p["signal_id"] == signal_id and p["status"] == "pending"]
-        if existing_pending:
-            if verbose:
-                print(f"  [ledger] Order already pending: {signal_id[:50]}")
-            continue
-
-        trade_id = f"QQQ_cont_{datetime.now(EST).strftime('%Y%m%d_%H%M%S')}"
-
-        trade = {
-            "id": trade_id,
-            "timestamp": datetime.now(EST).isoformat(),
-            "symbol": "QQQ",
-            "timeframe": "15m",
-            "direction": direction,
-            "entry_price": round(entry, 4),
-            "stop_loss": round(sl, 4),
-            "take_profit": round(tp, 4),
-            "current_price": round(current_price, 4),
-            "sl_distance": round(sl_dist, 4),
-            "rr_ratio": round(rr, 2),
-            "position_size": round(position_size, 4),
-            "risk_amount": round(risk_amount, 2),
-            "gross_potential": round(gross_potential, 2),
-            "net_potential": round(net_potential, 2),
-            "reason": sig.get("reason", ""),
-            "irl_target": sig.get("irl_target", None),
-            "be_triggered": False,
-            # Indicator snapshot
-            "atr_at_entry": indicators["atr_at_entry"],
-            "adx_at_entry": indicators["adx_at_entry"],
-            "rvol_at_entry": indicators["rvol_at_entry"],
-            "ema_direction": indicators["ema_direction"],
-            # Status — starts as "pending" until price fills the limit entry
-            "status": "pending",
-            "signal_id": signal_id,
-            "exit_price": None,
-            "exit_timestamp": None,
-            "gross_pnl": None,
-            "net_pnl": None,
-            "commission": round(commission, 2),
-            "slippage": None,
-        }
-
-        new_trades.append(trade)
-
-        # Register in state ledger immediately
-        add_pending_order(trade, signal_id, bar_time)
-
+    for symbol in LIVE_SYMBOLS:
         if verbose:
-            emoji = "🟢" if direction == "buy" else "🔴"
-            print(f"  {emoji} SIGNAL: QQQ continuation ({direction.upper()})")
-            print(f"     Entry:       ${entry:.2f}")
-            print(f"     Stop Loss:   ${sl:.2f} ({sl_dist:.2f} away)")
-            print(f"     Take Profit: ${tp:.2f}")
-            print(f"     RR:          {rr:.1f}:1")
-            print(f"     Risk:        ${risk_amount:.2f}")
-            print(f"     Size:        {position_size:.2f} shares")
-            print(f"     Net @ TP:    ${net_potential:+.2f} (after ${commission:.2f} comm + slip)")
-            print(f"     ATR: {indicators['atr_at_entry']} | ADX: {indicators['adx_at_entry']} | "
-                  f"RVOL: {indicators['rvol_at_entry']}x | EMA: {indicators['ema_direction']}")
-            print(f"     Reason:      {sig.get('reason', '')}")
+            print(f"\n  📡 Scanning {symbol}...")
 
-    if verbose and not new_trades:
-        print("  📊 No new signals — market conditions not aligned")
+        # Download fresh 15m data
+        df = download_data(symbol, period="60d", interval="15m")
+        if df.empty or len(df) < 50:
+            if verbose:
+                print(f"  ⚠️  {symbol}: Insufficient data — need at least 50 bars")
+            continue
 
-    return new_trades
+        # Generate signals using institutional engine
+        signals = generate_signals(df, LIVE_CONFIG)
+
+        # Filter to only recent signals (last 3 bars)
+        recent_signals = [s for s in signals if s.get("bar", 0) >= len(df) - 3]
+
+        new_trades = []
+        for sig in recent_signals:
+            entry = sig["entry"]
+            sl = sig["sl"]
+            tp = sig["tp"]
+            direction = sig["direction"]
+            bar_idx = sig["bar"]
+
+            sl_dist = abs(entry - sl)
+            if sl_dist <= 0:
+                continue
+
+            risk_amount = current_capital * RISK_PCT
+            position_size = risk_amount / sl_dist
+            rr = abs(tp - entry) / sl_dist
+
+            # Get indicator snapshot for CSV
+            indicators = get_indicator_snapshot(df, bar_idx, LIVE_CONFIG)
+
+            # Apply friction to estimate net P&L at TP
+            adj_entry, adj_exit_tp, commission = apply_friction(
+                entry, tp, direction, symbol, LIVE_CONFIG
+            )
+            if direction == "buy":
+                gross_potential = (tp - entry) * position_size
+                net_potential = (adj_exit_tp - adj_entry) * position_size - commission
+            else:
+                gross_potential = (entry - tp) * position_size
+                net_potential = (adj_entry - adj_exit_tp) * position_size - commission
+
+            current_price = float(df["Close"].iloc[-1])
+
+            # Build signal fingerprint for deduplication
+            bar_time = df.index[bar_idx]
+            signal_id = _signal_fingerprint(symbol, bar_time, entry, direction)
+
+            # Skip if we've already armed this exact signal in a prior cron run
+            if is_already_alerted(signal_id):
+                if verbose:
+                    print(f"  [ledger] Skipping duplicate signal: {signal_id[:50]}")
+                continue
+
+            # Also skip if there's already a pending order for this signal
+            ledger_check = load_state_ledger()
+            existing_pending = [p for p in ledger_check["pending_orders"]
+                                if p["signal_id"] == signal_id and p["status"] == "pending"]
+            if existing_pending:
+                if verbose:
+                    print(f"  [ledger] Order already pending: {signal_id[:50]}")
+                continue
+
+            trade_id = f"{symbol}_cont_{datetime.now(EST).strftime('%Y%m%d_%H%M%S')}"
+
+            trade = {
+                "id": trade_id,
+                "timestamp": datetime.now(EST).isoformat(),
+                "symbol": symbol,
+                "timeframe": "15m",
+                "direction": direction,
+                "entry_price": round(entry, 4),
+                "stop_loss": round(sl, 4),
+                "take_profit": round(tp, 4),
+                "current_price": round(current_price, 4),
+                "sl_distance": round(sl_dist, 4),
+                "rr_ratio": round(rr, 2),
+                "position_size": round(position_size, 4),
+                "risk_amount": round(risk_amount, 2),
+                "gross_potential": round(gross_potential, 2),
+                "net_potential": round(net_potential, 2),
+                "reason": sig.get("reason", ""),
+                "irl_target": sig.get("irl_target", None),
+                "be_triggered": False,
+                # Indicator snapshot
+                "atr_at_entry": indicators["atr_at_entry"],
+                "adx_at_entry": indicators["adx_at_entry"],
+                "rvol_at_entry": indicators["rvol_at_entry"],
+                "ema_direction": indicators["ema_direction"],
+                # Status — starts as "pending" until price fills the limit entry
+                "status": "pending",
+                "signal_id": signal_id,
+                "exit_price": None,
+                "exit_timestamp": None,
+                "gross_pnl": None,
+                "net_pnl": None,
+                "commission": round(commission, 2),
+                "slippage": None,
+            }
+
+            new_trades.append(trade)
+
+            # Register in state ledger immediately
+            add_pending_order(trade, signal_id, bar_time)
+
+            if verbose:
+                emoji = "🟢" if direction == "buy" else "🔴"
+                print(f"  {emoji} SIGNAL: {symbol} continuation ({direction.upper()})")
+                print(f"     Entry:       ${entry:.2f}")
+                print(f"     Stop Loss:   ${sl:.2f} ({sl_dist:.2f} away)")
+                print(f"     Take Profit: ${tp:.2f}")
+                print(f"     RR:          {rr:.1f}:1")
+                print(f"     Risk:        ${risk_amount:.2f}")
+                print(f"     Size:        {position_size:.2f} shares")
+                print(f"     Net @ TP:    ${net_potential:+.2f} (after ${commission:.2f} comm + slip)")
+                print(f"     ATR: {indicators['atr_at_entry']} | ADX: {indicators['adx_at_entry']} | "
+                      f"RVOL: {indicators['rvol_at_entry']}x | EMA: {indicators['ema_direction']}")
+                print(f"     Reason:      {sig.get('reason', '')}")
+
+        if verbose and not new_trades:
+            print(f"  📊 {symbol}: No new signals — market conditions not aligned")
+
+        all_new_trades.extend(new_trades)
+
+    return all_new_trades
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -789,8 +803,9 @@ def _close_trade(trade: Dict, exit_price: float, status: str, verbose: bool = Tr
     direction = trade["direction"]
     position_size = trade["position_size"]
 
+    symbol = trade.get("symbol", "QQQ")
     adj_entry, adj_exit, commission = apply_friction(
-        entry, exit_price, direction, "QQQ", LIVE_CONFIG
+        entry, exit_price, direction, symbol, LIVE_CONFIG
     )
 
     if direction == "buy":
@@ -850,13 +865,20 @@ def update_open_trades(verbose: bool = True) -> List[Dict[str, Any]]:
     if force_close and verbose:
         print("  ⏰ Past 3:30 PM EST — force-closing all open positions")
 
-    df = download_data("QQQ", period="5d", interval="15m")
-    if df.empty:
+    # Fetch latest prices for each symbol with open trades
+    _price_cache = {}
+    for sym in set(t.get("symbol", "QQQ") for t in open_trades):
+        _df = download_data(sym, period="5d", interval="15m")
+        if not _df.empty:
+            _price_cache[sym] = float(_df["Close"].iloc[-1])
+    if not _price_cache:
         return []
 
-    current_price = float(df["Close"].iloc[-1])
-
     for trade in open_trades:
+        sym = trade.get("symbol", "QQQ")
+        current_price = _price_cache.get(sym)
+        if current_price is None:
+            continue
         trade["current_price"] = round(current_price, 4)
         entry = trade["entry_price"]
         sl = trade["stop_loss"]
@@ -1278,9 +1300,11 @@ def main() -> None:
     print_ledger_status()
     expire_old_pending_orders()
     # Fetch latest bars to check pending fills before scanning for new signals
-    _df_for_pending = download_data("QQQ", period="5d", interval="15m")
-    if not _df_for_pending.empty:
-        resolve_pending_orders(_df_for_pending)
+    # Resolve pending orders for each live symbol
+    for _sym in LIVE_SYMBOLS:
+        _df_for_pending = download_data(_sym, period="5d", interval="15m")
+        if not _df_for_pending.empty:
+            resolve_pending_orders(_df_for_pending)
 
     # Scan for new signals
     new_signals = scan_for_signals(verbose=True)
