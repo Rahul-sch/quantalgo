@@ -46,12 +46,12 @@ from quant_engine import (
 from notifier import alert_new_trade, alert_session_summary, alert_daily_limit
 
 # Ensure instruments are available
-for _sym in ("QQQ", "SPY"):
+for _sym in ("QQQ", "SPY", "NVDA"):
     if _sym not in INSTRUMENTS:
         INSTRUMENTS[_sym] = _sym
 
 # Instruments to scan (order matters — QQQ first)
-LIVE_SYMBOLS = ["QQQ", "SPY"]
+LIVE_SYMBOLS = ["QQQ", "SPY", "NVDA"]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION — LOCKED LIVE-READY PARAMS
