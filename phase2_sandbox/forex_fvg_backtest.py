@@ -60,9 +60,14 @@ NY_END       =  660  # 11:00 ET
 RVOL_PERIOD = 20
 RVOL_MIN    = 1.2
 
-# Transaction costs (forex)
-SPREAD_COST_PCT = 0.002   # ~0.2 pips as % (approximate for major pairs)
-COMMISSION_PCT  = 0.0     # no commission on spot forex typically
+# Transaction costs (forex) — REALISTIC BROKER CONDITIONS
+# Spread: 1.5 pips applied at entry (worsens fill price)
+# Commission: $3.00 per standard lot (100K units) per round-trip
+SPREAD_PIPS     = 1.5     # spread penalty injected at entry
+PIP_VALUE_EUR   = 0.0001  # 1 pip for EUR/USD, GBP/USD, etc.
+PIP_VALUE_JPY   = 0.01    # 1 pip for JPY pairs
+COMMISSION_PER_LOT = 3.0  # $3.00 per 100K lot round-trip
+LOT_SIZE        = 100_000 # standard lot
 
 # ════════════════════════════════════════════════════════════════════════════
 # DATA LOADING
@@ -357,13 +362,14 @@ def simulate_breakeven(signals: List[Dict], df: pd.DataFrame,
         else:
             gross_pnl = (entry - exit_price) * units
 
-        # Transaction costs
-        cost = risk_per_trade * SPREAD_COST_PCT
-        net_pnl = gross_pnl - cost
+        # Commission: $3.00 per standard lot (100K units) round-trip
+        lots = units / LOT_SIZE
+        commission = lots * COMMISSION_PER_LOT
+        net_pnl = gross_pnl - commission
 
         # Adjust outcome based on net P&L for scratches
         if outcome == "scratch":
-            net_pnl = -cost  # scratch = lose the spread
+            net_pnl = -commission  # scratch = lose the commission only
 
         results.append({
             "bar_idx": bar_idx,
@@ -474,15 +480,20 @@ def generate_signals(df: pd.DataFrame, use_killzone: bool = True,
             if not (low[i] <= limit_price <= high[i]):
                 continue
 
-            # Build trade
-            entry = limit_price
+            # Build trade — inject 1.5 pip spread penalty at entry
+            # For longs: fill is WORSE (higher), for shorts: fill is WORSE (lower)
+            pip_val = PIP_VALUE_JPY if "JPY" in str(df.index.name) else PIP_VALUE_EUR
+            spread_penalty = SPREAD_PIPS * pip_val
+
             if direction == "long":
+                entry = limit_price + spread_penalty  # worse fill for buy
                 sl = entry - atr_arm * ATR_SL_MULT
                 risk = entry - sl
                 if risk <= 0:
                     continue
                 tp = entry + risk * RR_RATIO
             else:
+                entry = limit_price - spread_penalty  # worse fill for sell
                 sl = entry + atr_arm * ATR_SL_MULT
                 risk = sl - entry
                 if risk <= 0:
@@ -498,6 +509,7 @@ def generate_signals(df: pd.DataFrame, use_killzone: bool = True,
                 "tp": round(tp, 6),
                 "risk": round(risk, 6),
                 "fvg_rvol": round(sig_rvol, 4) if not np.isnan(sig_rvol) else np.nan,
+                "spread_applied": round(spread_penalty, 6),
             })
             to_remove.append(fvg_bar)
 
