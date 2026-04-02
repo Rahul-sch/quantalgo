@@ -8,8 +8,9 @@ Model: 15m FVG detection → displacement filter (1.0x ATR body) → retest entr
        → Break-Even at IRL → TP at 2.0x risk
 
 Killzones:
-  London Open: 03:00–05:00 ET
-  NY Open:     08:00–11:00 ET
+  London Open:        03:00–05:00 ET
+  NY Open + Follow:   08:00–12:00 ET
+  Late Day:           14:00–15:00 ET
 
 Writes signals to shared trade_state.json with model tag "fvg_killzone".
 Conflict resolution vs Goldbach handled by forex_manager.py.
@@ -58,10 +59,15 @@ RETEST_MAX_BARS = 20       # max bars to wait for FVG retest
 IRL_PIVOT_BARS  = 5        # local pivot lookback
 
 # ── Killzones (minutes since midnight ET) ──
+# London Open
 LONDON_START = 180    # 03:00 ET
 LONDON_END   = 300    # 05:00 ET
+# NY Open + Follow-Through (expanded from 11:00 to 12:00 per TOD analysis)
 NY_START     = 480    # 08:00 ET
-NY_END       = 660    # 11:00 ET
+NY_END       = 720    # 12:00 ET  ← was 11:00, +$4,589 P&L at 74% WR
+# Late Day micro-killzone (14:00-15:00 ET — 83% WR, PF 5.37 in backtest)
+LATE_START   = 840    # 14:00 ET
+LATE_END     = 900    # 15:00 ET
 
 # ── Realistic costs ──
 SPREAD_PIPS = 1.5     # spread penalty at entry
@@ -198,6 +204,8 @@ def is_in_killzone(ts: pd.Timestamp) -> Tuple[bool, str]:
         return True, "London"
     if NY_START <= mins < NY_END:
         return True, "NY"
+    if LATE_START <= mins < LATE_END:
+        return True, "Late-NY"
     return False, "none"
 
 
@@ -209,6 +217,8 @@ def is_killzone_now() -> Tuple[bool, str]:
         return True, "London"
     if NY_START <= mins < NY_END:
         return True, "NY"
+    if LATE_START <= mins < LATE_END:
+        return True, "Late-NY"
     return False, "none"
 
 
@@ -588,7 +598,7 @@ def main():
 
     if not in_kz and not args.force:
         print(f"\n  ⏰ Not in killzone — scanner idle.")
-        print(f"     London: 03:00–05:00 ET | NY: 08:00–11:00 ET")
+        print(f"     London: 03:00–05:00 ET | NY: 08:00–12:00 ET | Late: 14:00–15:00 ET")
         print(f"     Use --force to scan anyway.")
         return
 
