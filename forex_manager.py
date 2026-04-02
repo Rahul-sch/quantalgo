@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """
-FOREX TRADE MANAGER — Lifecycle management for Goldbach Forex positions
+FOREX TRADE MANAGER — Dual-Engine Lifecycle Management
+Manages both Goldbach PO3/PO9 AND FVG Killzone positions.
 Reads trade_state.json, checks fills/SL/TP against live prices, updates ledger.
 
+Dual Engine:
+  - Goldbach (goldbach_forex):   PO3/PO9 discount/premium bounce/rejection
+  - FVG Killzone (fvg_killzone): ICT Continuation model with BE at IRL
+
+Conflict Resolution:
+  Same direction on same pair:      Allow both (confluence)
+  Opposite direction on same pair:  FVG Killzone takes priority, Goldbach blocked
+
 Usage:
-    python3 forex_manager.py          # run check (called by cron every 15 min)
+    python3 forex_manager.py          # run check (called by cron every 30 min)
     python3 forex_manager.py --status # print current open forex trades
     python3 forex_manager.py --dry-run # check fills without writing to ledger
 
-Pairs supported: EURUSD, GBPUSD (extendable via FOREX_TICKERS)
+Pairs supported: 10 majors + crosses (see FOREX_TICKERS)
 """
 
 import os
@@ -165,7 +174,10 @@ def _is_forex_trade(order: Dict[str, Any]) -> bool:
     """Return True if this ledger entry is a Forex trade (not an equity trade)."""
     symbol = order.get("signal_id", "") + order.get("trade_id", "")
     pair = order.get("trade_id", "").split("_")[0].upper()
-    return pair in FOREX_TICKERS or order.get("model", "").startswith("goldbach_forex")
+    model = order.get("model", "")
+    return (pair in FOREX_TICKERS
+            or model.startswith("goldbach_forex")
+            or model == "fvg_killzone")
 
 
 def _pips(price_diff: float, pair: str) -> float:
@@ -258,20 +270,46 @@ def check_order_fills(
 
     # ── OPEN → check SL and TP ──
     if status == "open":
+        # Break-Even at IRL logic (FVG Killzone model)
+        be_triggered = order.get("be_triggered", False)
+        irl_target = order.get("irl_target")
+        model = order.get("model", "")
+
+        # Determine effective SL (if BE has been triggered, SL = entry)
+        effective_sl = entry if be_triggered else sl
+
         if direction == "buy":
+            # Check IRL hit for BE trigger (FVG killzone only)
+            if model == "fvg_killzone" and irl_target and not be_triggered:
+                if bar_high >= irl_target or current >= irl_target:
+                    order["be_triggered"] = True
+                    be_triggered = True
+                    effective_sl = entry
+
             tp_hit = bar_high >= tp or current >= tp
-            sl_hit = bar_low <= sl or current <= sl
+            sl_hit = bar_low <= effective_sl or current <= effective_sl
         else:
+            # Check IRL hit for BE trigger (FVG killzone only)
+            if model == "fvg_killzone" and irl_target and not be_triggered:
+                if bar_low <= irl_target or current <= irl_target:
+                    order["be_triggered"] = True
+                    be_triggered = True
+                    effective_sl = entry
+
             tp_hit = bar_low <= tp or current <= tp
-            sl_hit = bar_high >= sl or current >= sl
+            sl_hit = bar_high >= effective_sl or current >= effective_sl
 
         # Priority: if both hit same bar, assume SL (conservative / worst-case)
         if sl_hit and tp_hit:
+            if be_triggered:
+                return "closed_scratch", entry
             return "closed_sl", sl
         if tp_hit:
             return "closed_tp", tp
         if sl_hit:
-            return "closed_sl", sl
+            if be_triggered:
+                return "closed_scratch", entry
+            return "closed_sl", effective_sl
 
         return "open", None
 
@@ -303,9 +341,12 @@ def alert_filled(order: Dict[str, Any], quote: Dict[str, float]) -> None:
     tp = float(order["take_profit"])
     sl_pips = round(_pips(entry - sl, pair), 1)
     tp_pips = round(_pips(tp - entry, pair), 1)
+    model = order.get("model", "unknown")
+    model_label = "Goldbach" if "goldbach" in model else "FVG-Killzone" if model == "fvg_killzone" else model
     emoji = "🟢" if direction == "BUY" else "🔴"
     _send_alert(
         f"{emoji} FOREX FILLED: {pair} {direction}\n"
+        f"Source: {model_label}\n"
         f"Entry:  {entry:.5f}\n"
         f"SL:     {sl:.5f}  ({sl_pips:.0f} pips)\n"
         f"TP:     {tp:.5f}  ({tp_pips:.0f} pips)\n"
@@ -325,12 +366,24 @@ def alert_closed(order: Dict[str, Any], exit_price: float,
     pair = order.get("trade_id", "???").split("_")[0]
     direction = order["direction"].upper()
     entry = float(order["entry_price"])
-    result = "WIN ✅" if new_status == "closed_tp" else "LOSS ❌"
+    model = order.get("model", "unknown")
+    model_label = "Goldbach" if "goldbach" in model else "FVG-Killzone" if model == "fvg_killzone" else model
+
+    if new_status == "closed_tp":
+        result = "WIN ✅"
+        emoji = "💚"
+    elif new_status == "closed_scratch":
+        result = "SCRATCH 🔄"
+        emoji = "🔄"
+    else:
+        result = "LOSS ❌"
+        emoji = "🔴"
+
     pnl_sign = "+" if gross_pnl >= 0 else ""
     pnl_pips = round(_pips(abs(exit_price - entry), pair), 1)
-    emoji = "💚" if new_status == "closed_tp" else "🔴"
     msg = (
         f"{emoji} FOREX CLOSED: {pair} {direction} — {result}\n"
+        f"Source: {model_label}\n"
         f"Entry:  {entry:.5f}\n"
         f"Exit:   {exit_price:.5f}  ({pnl_pips:.0f} pips)\n"
         f"P&L:    {pnl_sign}${gross_pnl:.2f}"
@@ -447,7 +500,7 @@ def run_manager(dry_run: bool = False) -> None:
             print(f"     ✅ FILLED at {order['entry_price']}")
             alert_filled(order, quote)
 
-        elif new_status in ("closed_tp", "closed_sl", "expired"):
+        elif new_status in ("closed_tp", "closed_sl", "closed_scratch", "expired"):
             actual_exit = exit_price or quote["price"]
             order["exit_price"] = actual_exit
             order["exit_timestamp"] = now.isoformat()
@@ -460,6 +513,9 @@ def run_manager(dry_run: bool = False) -> None:
             if new_status == "closed_tp":
                 pips = round(_pips(abs(actual_exit - float(order["entry_price"])), pair), 1)
                 print(f"     🏆 TP HIT @ {actual_exit:.5f} (+{pips:.0f} pips | ${gross:+.2f})")
+                alert_closed(order, actual_exit, new_status, gross)
+            elif new_status == "closed_scratch":
+                print(f"     🔄 SCRATCH (BE at IRL) @ {actual_exit:.5f} (${gross:+.2f})")
                 alert_closed(order, actual_exit, new_status, gross)
             elif new_status == "closed_sl":
                 pips = round(_pips(abs(actual_exit - float(order["entry_price"])), pair), 1)
