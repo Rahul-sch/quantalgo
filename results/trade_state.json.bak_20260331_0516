@@ -1,0 +1,25 @@
+{
+  "date": "2026-03-31",
+  "pending_orders": [
+    {
+      "signal_id": "EURUSD_20260331_1.14679_buy",
+      "trade_id": "EURUSD_goldbach_20260331_032005",
+      "direction": "buy",
+      "entry_price": 1.14679,
+      "stop_loss": 1.14998,
+      "take_profit": 1.15274,
+      "armed_at": "2026-03-31T03:20:05.399385-04:00",
+      "armed_bar_time": "2026-03-31T03:20:05.399385-04:00",
+      "expires_after": "2026-03-31T17:00:00-04:00",
+      "status": "closed_sl",
+      "model": "goldbach_forex",
+      "exit_price": 1.14998,
+      "exit_timestamp": "2026-03-31T08:13:07.029972-04:00",
+      "gross_pnl": 31.9,
+      "net_pnl": 31.9
+    }
+  ],
+  "alerted_signal_ids": [
+    "EURUSD_20260331_1.14679_buy"
+  ]
+}
