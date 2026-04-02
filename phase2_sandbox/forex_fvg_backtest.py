@@ -34,8 +34,9 @@ from typing import List, Dict, Optional, Tuple
 # CONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════
 
-PAIRS = ["EURUSD=X", "GBPUSD=X"]
-PAIR_LABELS = {"EURUSD=X": "EUR/USD", "GBPUSD=X": "GBP/USD"}
+PAIRS = ["EURUSD=X", "GBPUSD=X", "JPY=X", "AUDUSD=X"]
+PAIR_LABELS = {"EURUSD=X": "EUR/USD", "GBPUSD=X": "GBP/USD",
+               "JPY=X": "USD/JPY", "AUDUSD=X": "AUD/USD"}
 
 # Risk management
 RISK_PER_TRADE = 100.0   # $100 per trade
